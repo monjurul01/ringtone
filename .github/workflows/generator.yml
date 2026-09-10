@@ -209,7 +209,7 @@ jobs:
           };
 
           // ─── R2 WORKER URL ────────────────────────────────────────────────────────
-          const R2_WORKER_URL = 'https://proud-paper-6fd7.monjurulgd2001.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
+          const R2_WORKER_URL = 'https://zedgemedia.monjurulgd2001.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
 
           // Resolve which DB URLs to target
           let TARGET_DB_URLS;
