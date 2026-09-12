@@ -1994,7 +1994,12 @@ jobs:
             await geminiPage.keyboard.press('Enter');
             console.log(`    ⌨️  Submitted via Enter key`);
 
-            const deadline = Date.now() + 90000;
+            /* v16: response wait - 180s window, and accept the reply as soon as
+               all four tags are on screen instead of always polling to the end. */
+            const RESPONSE_TIMEOUT_MS = 180000;
+            const hasAllMetaTags = (t) => /\[TITLE\]/i.test(t) && /\[KEYWORDS\]/i.test(t)
+              && /\[CATEGORY\]/i.test(t) && /\[DESCRIPTION\]/i.test(t);
+            const deadline = Date.now() + RESPONSE_TIMEOUT_MS;
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -2002,7 +2007,7 @@ jobs:
             while (Date.now() < deadline) {
               await sleep(1500);
               const currentCount = await getResponseCount();
-              if (currentCount <= initialCount) continue;
+              const countGrew = currentCount > initialCount;
 
               const latestText = await geminiPage.evaluate(() => {
                 const selectors = [
@@ -2024,6 +2029,12 @@ jobs:
 
               if (!latestText) continue;
 
+              /* v16: complete reply already rendered - take it right away */
+              if (hasAllMetaTags(latestText)) { responseText = latestText; break; }
+
+              /* reply still incomplete and no new response element yet - keep waiting */
+              if (!countGrew) continue;
+
               if (latestText === lastSeen) {
                 stableCount++;
                 if (stableCount >= 2) { responseText = latestText; break; }
@@ -2033,7 +2044,7 @@ jobs:
               }
             }
 
-            if (!responseText) throw new Error('Gemini web timeout: no response within 90s');
+            if (!responseText) throw new Error(`Gemini web timeout: no response within ${RESPONSE_TIMEOUT_MS / 1000}s`);
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
           }
@@ -2521,7 +2532,8 @@ jobs:
                     lastMetaErr = metaErr;
                     console.warn(`  ⚠️ Attempt ${attempt}/${MAX_META_ATTEMPTS} failed: ${metaErr.message}`);
                     if (attempt < MAX_META_ATTEMPTS) {
-                      const backoffMs = 10000 * attempt;
+                      /* v16: a timeout already burned the full wait - retry sooner */
+                      const backoffMs = /timeout/i.test(metaErr.message || '') ? 5000 : 10000 * attempt;
                       console.log(`  ⏳ Cooling down ${backoffMs / 1000}s before retry...`);
                       await sleep(backoffMs);
                     }
