@@ -799,7 +799,7 @@ jobs:
               await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
               await page.click('button[type="submit"]');
 
-              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
+              // ── Step 8: Wait for OAuth code exchange + extract token ────��─────────
               // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
               // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
               // We MUST NOT navigate away during this exchange — stay on callback URL!
@@ -2341,10 +2341,35 @@ jobs:
               return match ? match[1].trim() : '';
             };
 
+            // ─── RESPONSE VALIDATION (v13) ──────────────────────────────────────
+            // A healthy Gemini reply carries the [TITLE] / [KEYWORDS] / [CATEGORY] /
+            // [DESCRIPTION] tags. When the session is stale, rate-limited, or the
+            // image never attached, Gemini answers with a short refusal and every
+            // tag is missing. That used to fall back to `Image <key>` + OTHER and
+            // still got written to Firebase as a success, so the item looked "done"
+            // and was never retried again. Fail loudly instead.
+            const REQUIRED_TAGS = ['TITLE', 'KEYWORDS', 'CATEGORY', 'DESCRIPTION'];
+            const foundTags = REQUIRED_TAGS.filter(t => getTagValue(responseText, t));
+            if (foundTags.length < 2) {
+              const preview = String(responseText || '').replace(/\s+/g, ' ').slice(0, 160);
+              throw new Error(`Bad Gemini response - only ${foundTags.length}/4 tags found (${String(responseText || '').length} chars): "${preview}"`);
+            }
+            if (!getTagValue(responseText, 'TITLE')) {
+              throw new Error('Bad Gemini response - [TITLE] tag missing, refusing junk fallback title');
+            }
+
             const title       = cleanTitle(getTagValue(responseText, 'TITLE'))       || `Image ${key.slice(0, 8)}`;
             const tags        = cleanKeywords(getTagValue(responseText, 'KEYWORDS'));
             const category    = cleanCategory(getTagValue(responseText, 'CATEGORY'));
             const description = cleanDescription(getTagValue(responseText, 'DESCRIPTION'));
+
+            // Title parsed down to nothing, or no usable keywords => still junk.
+            if (!title || /^Image /.test(title)) {
+              throw new Error(`Bad Gemini response - unusable title after cleaning ("${title}")`);
+            }
+            if (!tags) {
+              throw new Error('Bad Gemini response - no usable keywords parsed');
+            }
 
             console.log(`  ✨ Title    : "${title}"`);
             console.log(`  🏷️  Tags     : ${tags}`);
@@ -2482,7 +2507,29 @@ jobs:
               let tmpImagePath = null;
               try {
                 tmpImagePath = await imageToTempFile(record, key, kind);
-                const metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+
+                // Retry bad/empty Gemini replies (v13) instead of saving junk once.
+                const MAX_META_ATTEMPTS = 3;
+                let metadata = null;
+                let lastMetaErr = null;
+                for (let attempt = 1; attempt <= MAX_META_ATTEMPTS; attempt++) {
+                  try {
+                    metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                    lastMetaErr = null;
+                    break;
+                  } catch (metaErr) {
+                    lastMetaErr = metaErr;
+                    console.warn(`  ⚠️ Attempt ${attempt}/${MAX_META_ATTEMPTS} failed: ${metaErr.message}`);
+                    if (attempt < MAX_META_ATTEMPTS) {
+                      const backoffMs = 10000 * attempt;
+                      console.log(`  ⏳ Cooling down ${backoffMs / 1000}s before retry...`);
+                      await sleep(backoffMs);
+                    }
+                  }
+                }
+                if (!metadata) {
+                  throw lastMetaErr || new Error('Metadata generation failed - nothing written to Firebase');
+                }
 
                 await firebasePatchMetadata(db.url, IMAGE_QUEUE_PATH, key, {
                   title: metadata.title,
@@ -2505,8 +2552,8 @@ jobs:
               }
 
               if (i < toProcess.length - 1) {
-                console.log('  ⏳ Waiting 3s before next image...');
-                await sleep(3000);
+                console.log('  ⏳ Waiting 8s before next image...');
+                await sleep(8000);
               }
             }
           }
