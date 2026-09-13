@@ -449,6 +449,51 @@ jobs:
             return words.slice(0, 5).join(' ');
           }
 
+          // ─── ZEDGE CONTENT POLICY GUARD (v21) ─────────────────────────────────────
+          // Enforces Zedge's Content Guidelines on everything this workflow produces:
+          // original-only (no artists, songs, characters, brands, logos, celebrities), no
+          // adult / hate / violence / drugs / illegal content, accurate non-promotional
+          // metadata, 2–10 real tags. Violations are regenerated or skipped — never uploaded.
+          const ZEDGE_POLICY_RULES = `ZEDGE MARKETPLACE POLICY (MANDATORY — a single violation permanently suspends the seller account):
+          - 100% ORIGINAL work only. Never name, reference, imitate or hint at any real artist, band, singer, song, lyric, album, film, TV show, game, anime, cartoon, comic, character, franchise, brand, company, product, logo, trademark, sports team, celebrity or public figure. No "in the style of", no "sounds like", no theme/cover/remix of anything existing.
+          - No sexual, suggestive, nude or adult content. No hate speech, slurs, hate symbols, discrimination or stereotypes. No violence, gore, weapons, drugs, self-harm or illegal activity. Nothing involving minors.
+          - Metadata must be truthful and describe ONLY this item. No promotional or spam words (free, download, app, website, subscribe, follow, link, buy), no URLs, hashtags, @handles, emojis, brand or service names, no misleading keywords.
+          - Keywords: between 2 and 10 genuine descriptive single words.`;
+          const POLICY_PROMO = /\b(free|download|downloads|website|subscribe|follow|buy|sale|discount|promo|www|http|https|telegram|whatsapp|instagram|tiktok|youtube|facebook|twitter|zedge)\b/i;
+          const POLICY_ADULT = /\b(sexy|sex|sexual|nude|nudity|naked|porn|porno|xxx|erotic|erotica|boobs|breasts?|booty|bikini|lingerie|topless|hot girls?|seductive|nsfw|hentai|fetish|stripper|thong|underwear|cleavage)\b/i;
+          const POLICY_HARM = /\b(nigg\w*|fagg?\w*|retard\w*|murder|gore|gun|guns|rifle|pistol|shooting|shooter|terror\w*|nazi|hitler|swastika|isis|jihad|marijuana|cocaine|heroin|meth|drugs|suicide|self-harm|rape|racist|slur)\b/i;
+          const POLICY_IP = /\b(disney|pixar|marvel|dc comics|batman|superman|spider-?man|iron ?man|avengers|wolverine|x-?men|deadpool|harley quinn|star ?wars|darth|vader|yoda|jedi|mandalorian|grogu|harry ?potter|hogwarts|lord of the rings|hobbit|game of thrones|stranger things|squid game|breaking bad|pokemon|pikachu|charizard|super mario|luigi|zelda|minecraft|fortnite|roblox|among us|gta|call of duty|pubg|free fire|valorant|league of legends|overwatch|god of war|kratos|elden ring|naruto|goku|dragon ?ball|one piece|luffy|attack on titan|demon slayer|jujutsu|gojo|itachi|sasuke|death note|my hero academia|hello kitty|sanrio|mickey|minnie|donald duck|elsa|moana|encanto|toy story|shrek|minions|despicable|kung fu panda|spongebob|simpsons|rick and morty|peppa|paw patrol|barbie|hot wheels|lego|nike|adidas|puma|gucci|louis vuitton|iphone|samsung|xiaomi|oneplus|huawei|tesla|bmw|mercedes|audi|ferrari|lamborghini|porsche|toyota|coca-?cola|pepsi|starbucks|mcdonald'?s|kfc|netflix|spotify|nfl|nba|fifa|uefa|real madrid|barcelona|manchester united|liverpool fc|juventus|psg|messi|ronaldo|neymar|mbappe|lebron|taylor swift|beyonce|drake|eminem|rihanna|bts|blackpink|billie eilish|ed sheeran|weeknd|bad bunny|justin bieber|ariana grande|dua lipa|coldplay|imagine dragons|linkin park|metallica|beatles|nirvana|michael jackson|elvis|kanye|travis scott|post malone|shakira|adele|bruno mars|hans zimmer|john williams|bollywood|shah rukh|salman khan|allu arjun|pushpa|kgf|pathaan|jawan|kabir singh|arijit|pritam|ar rahman|a\.r\. rahman|anirudh|nokia|nokia tune|marimba|over the horizon|xbox|playstation|nintendo|godzilla|king kong|jurassic|transformers|optimus prime|bumblebee|pirates of the caribbean|jack sparrow|james bond|mission impossible|john wick|fast and furious|terminator|poppy playtime|huggy wuggy|skibidi|fnaf|cuphead|genshin|honkai|clash of clans|clash royale|brawl stars|candy crush|angry birds|subway surfers|temple run|flappy bird|tom and jerry|doraemon|shinchan|ben 10|scooby|looney|bugs bunny|winnie the pooh|cars movie|lightning mcqueen|olaf|stitch|lilo|baymax|zootopia|inside out|wednesday addams|squid|haikyuu|chainsaw man|spy x family|frieren|solo leveling|sung jinwoo)\b/i;
+          function zedgePolicyIssues(meta) {
+            const issues = [];
+            const fields = { title: meta.title || '', tags: meta.tags || '', description: meta.description || '', prompt: meta.enhancedPrompt || '' };
+            for (const [f, v] of Object.entries(fields)) {
+              if (!v) continue;
+              const ip = v.match(POLICY_IP); if (ip) issues.push(`${f}: protected name "${ip[0]}"`);
+              const ad = v.match(POLICY_ADULT); if (ad) issues.push(`${f}: adult term "${ad[0]}"`);
+              const hv = v.match(POLICY_HARM); if (hv) issues.push(`${f}: prohibited term "${hv[0]}"`);
+              if (f !== 'prompt') {
+                const pr = v.match(POLICY_PROMO); if (pr) issues.push(`${f}: promotional/spam word "${pr[0]}"`);
+                if (/[#@]|https?:|www\.|\.(com|net|org|io|app)\b/i.test(v)) issues.push(`${f}: link/hashtag/handle`);
+              }
+            }
+            return issues;
+          }
+          function zedgeCleanTags(tags) {
+            const words = String(tags || '').split(/[,\s]+/).map(w => w.trim().toLowerCase()).filter(w => /^[a-z0-9-]{2,20}$/.test(w));
+            const out = [];
+            for (const w of words) if (!out.includes(w) && !POLICY_IP.test(w) && !POLICY_ADULT.test(w) && !POLICY_HARM.test(w) && !POLICY_PROMO.test(w)) out.push(w);
+            return out.slice(0, 10);
+          }
+          // Returns { issues, meta } — meta has policy-clean, deduped, 2–10 tags.
+          function zedgeEnforce(meta, kind) {
+            const issues = zedgePolicyIssues(meta);
+            const tags = zedgeCleanTags(meta.tags);
+            const fallback = kind === 'image' ? ['wallpaper', 'background', 'art', 'design', 'phone', 'screen'] : ['melody', 'tune', 'alert', 'phone', 'music', 'sound'];
+            const cat = String(meta.category || '').toLowerCase().replace(/[^a-z]/g, '');
+            if (cat && cat !== 'other' && !tags.includes(cat)) tags.unshift(cat);
+            for (const w of fallback) { if (tags.length >= 2) break; if (!tags.includes(w)) tags.push(w); }
+            return { issues, meta: { ...meta, tags: tags.slice(0, 10).join(', ') } };
+          }
           // ─── METADATA GENERATION ───────────────────────────────────────────────────
           // ─── SMART PROMPT VARIETY ENGINE ─────────────────────────────────────────
           // 1) Shuffled-deck sampling: all 15 themes are dealt before any theme repeats.
@@ -569,7 +614,7 @@ jobs:
               : '';
 
             // Construct the single, unified consolidated prompt
-            const CONSOLIDATED_PROMPT = `You are an award-winning mobile sound designer and metadata optimizer. Your ringtones and notification sounds top marketplace charts because they are wildly creative, instantly catchy, and a genuine pleasure to hear — people happily pay for them.\n\n` +
+            const CONSOLIDATED_PROMPT = `You are an award-winning mobile sound designer and metadata optimizer. Your ringtones and notification sounds top marketplace charts because they are wildly creative, instantly catchy, and a genuine pleasure to hear — people happily pay for them.\n\n${ZEDGE_POLICY_RULES}\n\n` +
               (prompt 
                 ? `I want to generate a ${soundType} based on this idea: "${prompt}".\n` +
                   `Rewrite it into a vivid, detailed 30-word text-to-music prompt with organic, high-definition textures.\n\n${craftRules}\n\n[Salt: ${randomSalt}]\n\n`
@@ -581,7 +626,7 @@ jobs:
                   `${noveltyBlock}[Random Salt: ${randomSalt}]\n\n`) +
               `Based on that generated text-to-music prompt, also generate the following metadata:\n` +
               `1. A creative and UNIQUE title (max 25 characters). DO NOT USE THESE BANNED WORDS: ${BANNED_WORDS}. Reflect the ${selectedPath} nature and ${soundType} purpose using evocative imagery. No quotes.\n` +
-              `2. 15 relevant, descriptive SINGLE-WORD keywords (comma-separated). Focus on genre, mood, animals, emotions, vibes. Avoid generic terms.\n` +
+              `2. 10 relevant, descriptive SINGLE-WORD keywords (comma-separated) that truthfully describe THIS sound only. Focus on genre, mood, animals, emotions, vibes. No brands, artists, promo words.\n` +
               `3. The most appropriate category selected ONLY from this list: ${validCategories}.\n` +
               `4. A SHORT description in MAXIMUM 5 WORDS capturing the soul of the sound. No punctuation, no sentences.\n\n` +
               `CRITICAL: You MUST format your entire response exactly like this template so it can be parsed programmatically. Do not include any introductory or concluding text outside these tags:\n` +
@@ -799,7 +844,7 @@ jobs:
               await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
               await page.click('button[type="submit"]');
 
-              // ── Step 8: Wait for OAuth code exchange + extract token ────��─────────
+              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
               // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
               // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
               // We MUST NOT navigate away during this exchange — stay on callback URL!
@@ -1103,7 +1148,7 @@ jobs:
           // Uploads an audio Buffer to Cloudflare R2 via the worker and returns the public URL.
           async function uploadToR2(audioBuffer, fileName, dbName) {
             const cleanedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-            const destinationKey = `${dbName}/${Date.now()}_${cleanedName}`;
+            const destinationKey = `${String(dbName).replace(/^zedge_?/i, 'zedge')}/ringtone/${Date.now()}_${cleanedName}`; // v21.1: same folder layout as panel/app (zedgeN/ringtone/)
             let response;
             try {
               response = await fetch(R2_WORKER_URL, {
@@ -1188,28 +1233,6 @@ jobs:
               const fn = styles[Math.floor(Math.random() * styles.length)];
               return `${fn()}.mp3`;
 
-            } else if (dbName === 'zedge_4') {
-              // ── zedge_4: "downloaded / shared file" style — Title-Case words, dashes, like files saved from apps ──
-              const words = ['Ringtone', 'Tone', 'Sound', 'Alarm', 'Notification', 'Message', 'Melody', 'Beat', 'Loop', 'Alert', 'Chime', 'Ring'];
-              const tags = ['Download', 'Free', 'HD', 'New', 'Best', 'Top', 'Original', 'Remix', 'Short', 'Clean'];
-              const apps = ['WhatsApp-Audio', 'Telegram-Audio', 'Voice-Memo', 'Audio-Clip', 'Sound-Clip'];
-              const roll = Math.random();
-              let name = '';
-              if (roll < 0.35) {
-                // e.g. Ringtone-Download-23, Alarm-HD-7
-                name = words[Math.floor(Math.random() * words.length)] + '-' + tags[Math.floor(Math.random() * tags.length)] + '-' + (Math.floor(Math.random() * 99) + 1);
-              } else if (roll < 0.7) {
-                // e.g. WhatsApp-Audio-2025-03-14, Voice-Memo-0042
-                const d = new Date();
-                const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-                name = apps[Math.floor(Math.random() * apps.length)] + '-' + (Math.random() > 0.5 ? dateStr : String(Math.floor(Math.random() * 9999)).padStart(4, '0'));
-              } else {
-                // e.g. New-Tone, Best-Melody-Remix
-                name = tags[Math.floor(Math.random() * tags.length)] + '-' + words[Math.floor(Math.random() * words.length)];
-                if (Math.random() > 0.5) name += '-' + tags[Math.floor(Math.random() * tags.length)];
-              }
-              return `${name}.mp3`;
-
             } else {
               // fallback: keyboard smash
               const pool = 'asdfghjklqwertyuiop';
@@ -1224,21 +1247,20 @@ jobs:
           // Each call produces a fresh audio (new seed) + fresh metadata → unique upload.
           async function generateAndPushOne(prompt, dbTarget) {
             // Step A: Unique metadata per account (Gemini re-called each time)
-            let meta;
-            try {
-              meta = await generateMetadataFromPrompt(prompt);
-              console.log(`  📝 [${dbTarget.name}] Title: "${meta.title}"`);
-              console.log(`  🏷️  [${dbTarget.name}] Tags: ${meta.tags}`);
-            } catch (e) {
-              console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
-              meta = {
-                enhancedPrompt: prompt || 'electronic synth pulse',
-                title: (prompt || 'Random Ringtone').split(' ').slice(0, 4).join(' ').slice(0, 30),
-                tags: '',
-                category: 'OTHER',
-                description: ''
-              };
+            // Zedge policy: the user-supplied idea itself must be clean (no artists/characters/brands).
+            if (prompt) { const pi = zedgePolicyIssues({ title: prompt }); if (pi.length) throw new Error(`Zedge policy: idea prompt blocked — ${pi.join('; ')} (nothing generated)`); }
+            let meta = null;
+            for (let attempt = 1; attempt <= 3 && !meta; attempt++) {
+              let candidate;
+              try { candidate = await generateMetadataFromPrompt(prompt); }
+              catch (e) { console.warn(`  ⚠️ [${dbTarget.name}] Metadata attempt ${attempt}/3 failed: ${e.message}`); continue; }
+              const check = zedgeEnforce(candidate, 'audio');
+              if (check.issues.length) { console.warn(`  🚫 [${dbTarget.name}] Zedge policy (attempt ${attempt}/3): ${check.issues.join('; ')} — regenerating`); continue; }
+              meta = check.meta;
             }
+            if (!meta) throw new Error('Zedge policy: no compliant metadata after 3 attempts — item skipped, nothing uploaded');
+            console.log(`  📝 [${dbTarget.name}] Title: "${meta.title}"`);
+            console.log(`  🏷️  [${dbTarget.name}] Tags: ${meta.tags}  ✅ policy-checked`);
 
             // Step B: Generate unique audio (each call gets a random seed → different sound)
             const { resultUrl } = await generateStableAudio(meta.enhancedPrompt, LENGTH_SECONDS);
@@ -1284,6 +1306,8 @@ jobs:
               tags: meta.tags,
               category: meta.category,
               description: meta.description,
+              policyCheck: 'passed',
+              policyCheckedAt: Date.now(),
               status: 'queued',
               prompt,
               // Audio processing audit trail (visible in panel/app item details)
@@ -1874,6 +1898,51 @@ jobs:
             return candidates;
           }
 
+          // ─── ZEDGE CONTENT POLICY GUARD (v21) ─────────────────────────────────────
+          // Enforces Zedge's Content Guidelines on everything this workflow produces:
+          // original-only (no artists, songs, characters, brands, logos, celebrities), no
+          // adult / hate / violence / drugs / illegal content, accurate non-promotional
+          // metadata, 2–10 real tags. Violations are regenerated or skipped — never uploaded.
+          const ZEDGE_POLICY_RULES = `ZEDGE MARKETPLACE POLICY (MANDATORY — a single violation permanently suspends the seller account):
+          - 100% ORIGINAL work only. Never name, reference, imitate or hint at any real artist, band, singer, song, lyric, album, film, TV show, game, anime, cartoon, comic, character, franchise, brand, company, product, logo, trademark, sports team, celebrity or public figure. No "in the style of", no "sounds like", no theme/cover/remix of anything existing.
+          - No sexual, suggestive, nude or adult content. No hate speech, slurs, hate symbols, discrimination or stereotypes. No violence, gore, weapons, drugs, self-harm or illegal activity. Nothing involving minors.
+          - Metadata must be truthful and describe ONLY this item. No promotional or spam words (free, download, app, website, subscribe, follow, link, buy), no URLs, hashtags, @handles, emojis, brand or service names, no misleading keywords.
+          - Keywords: between 2 and 10 genuine descriptive single words.`;
+          const POLICY_PROMO = /\b(free|download|downloads|website|subscribe|follow|buy|sale|discount|promo|www|http|https|telegram|whatsapp|instagram|tiktok|youtube|facebook|twitter|zedge)\b/i;
+          const POLICY_ADULT = /\b(sexy|sex|sexual|nude|nudity|naked|porn|porno|xxx|erotic|erotica|boobs|breasts?|booty|bikini|lingerie|topless|hot girls?|seductive|nsfw|hentai|fetish|stripper|thong|underwear|cleavage)\b/i;
+          const POLICY_HARM = /\b(nigg\w*|fagg?\w*|retard\w*|murder|gore|gun|guns|rifle|pistol|shooting|shooter|terror\w*|nazi|hitler|swastika|isis|jihad|marijuana|cocaine|heroin|meth|drugs|suicide|self-harm|rape|racist|slur)\b/i;
+          const POLICY_IP = /\b(disney|pixar|marvel|dc comics|batman|superman|spider-?man|iron ?man|avengers|wolverine|x-?men|deadpool|harley quinn|star ?wars|darth|vader|yoda|jedi|mandalorian|grogu|harry ?potter|hogwarts|lord of the rings|hobbit|game of thrones|stranger things|squid game|breaking bad|pokemon|pikachu|charizard|super mario|luigi|zelda|minecraft|fortnite|roblox|among us|gta|call of duty|pubg|free fire|valorant|league of legends|overwatch|god of war|kratos|elden ring|naruto|goku|dragon ?ball|one piece|luffy|attack on titan|demon slayer|jujutsu|gojo|itachi|sasuke|death note|my hero academia|hello kitty|sanrio|mickey|minnie|donald duck|elsa|moana|encanto|toy story|shrek|minions|despicable|kung fu panda|spongebob|simpsons|rick and morty|peppa|paw patrol|barbie|hot wheels|lego|nike|adidas|puma|gucci|louis vuitton|iphone|samsung|xiaomi|oneplus|huawei|tesla|bmw|mercedes|audi|ferrari|lamborghini|porsche|toyota|coca-?cola|pepsi|starbucks|mcdonald'?s|kfc|netflix|spotify|nfl|nba|fifa|uefa|real madrid|barcelona|manchester united|liverpool fc|juventus|psg|messi|ronaldo|neymar|mbappe|lebron|taylor swift|beyonce|drake|eminem|rihanna|bts|blackpink|billie eilish|ed sheeran|weeknd|bad bunny|justin bieber|ariana grande|dua lipa|coldplay|imagine dragons|linkin park|metallica|beatles|nirvana|michael jackson|elvis|kanye|travis scott|post malone|shakira|adele|bruno mars|hans zimmer|john williams|bollywood|shah rukh|salman khan|allu arjun|pushpa|kgf|pathaan|jawan|kabir singh|arijit|pritam|ar rahman|a\.r\. rahman|anirudh|nokia|nokia tune|marimba|over the horizon|xbox|playstation|nintendo|godzilla|king kong|jurassic|transformers|optimus prime|bumblebee|pirates of the caribbean|jack sparrow|james bond|mission impossible|john wick|fast and furious|terminator|poppy playtime|huggy wuggy|skibidi|fnaf|cuphead|genshin|honkai|clash of clans|clash royale|brawl stars|candy crush|angry birds|subway surfers|temple run|flappy bird|tom and jerry|doraemon|shinchan|ben 10|scooby|looney|bugs bunny|winnie the pooh|cars movie|lightning mcqueen|olaf|stitch|lilo|baymax|zootopia|inside out|wednesday addams|squid|haikyuu|chainsaw man|spy x family|frieren|solo leveling|sung jinwoo)\b/i;
+          function zedgePolicyIssues(meta) {
+            const issues = [];
+            const fields = { title: meta.title || '', tags: meta.tags || '', description: meta.description || '', prompt: meta.enhancedPrompt || '' };
+            for (const [f, v] of Object.entries(fields)) {
+              if (!v) continue;
+              const ip = v.match(POLICY_IP); if (ip) issues.push(`${f}: protected name "${ip[0]}"`);
+              const ad = v.match(POLICY_ADULT); if (ad) issues.push(`${f}: adult term "${ad[0]}"`);
+              const hv = v.match(POLICY_HARM); if (hv) issues.push(`${f}: prohibited term "${hv[0]}"`);
+              if (f !== 'prompt') {
+                const pr = v.match(POLICY_PROMO); if (pr) issues.push(`${f}: promotional/spam word "${pr[0]}"`);
+                if (/[#@]|https?:|www\.|\.(com|net|org|io|app)\b/i.test(v)) issues.push(`${f}: link/hashtag/handle`);
+              }
+            }
+            return issues;
+          }
+          function zedgeCleanTags(tags) {
+            const words = String(tags || '').split(/[,\s]+/).map(w => w.trim().toLowerCase()).filter(w => /^[a-z0-9-]{2,20}$/.test(w));
+            const out = [];
+            for (const w of words) if (!out.includes(w) && !POLICY_IP.test(w) && !POLICY_ADULT.test(w) && !POLICY_HARM.test(w) && !POLICY_PROMO.test(w)) out.push(w);
+            return out.slice(0, 10);
+          }
+          // Returns { issues, meta } — meta has policy-clean, deduped, 2–10 tags.
+          function zedgeEnforce(meta, kind) {
+            const issues = zedgePolicyIssues(meta);
+            const tags = zedgeCleanTags(meta.tags);
+            const fallback = kind === 'image' ? ['wallpaper', 'background', 'art', 'design', 'phone', 'screen'] : ['melody', 'tune', 'alert', 'phone', 'music', 'sound'];
+            const cat = String(meta.category || '').toLowerCase().replace(/[^a-z]/g, '');
+            if (cat && cat !== 'other' && !tags.includes(cat)) tags.unshift(cat);
+            for (const w of fallback) { if (tags.length >= 2) break; if (!tags.includes(w)) tags.push(w); }
+            return { issues, meta: { ...meta, tags: tags.slice(0, 10).join(', ') } };
+          }
           // ─── FIREBASE: PATCH METADATA ─────────────────────────────────────────────
           async function firebasePatchMetadata(dbUrl, queuePath, key, metadata) {
             const res = await fetch(`${dbUrl}/${queuePath}/${key}.json`, {
@@ -1994,12 +2063,7 @@ jobs:
             await geminiPage.keyboard.press('Enter');
             console.log(`    ⌨️  Submitted via Enter key`);
 
-            /* v16: response wait - 180s window, and accept the reply as soon as
-               all four tags are on screen instead of always polling to the end. */
-            const RESPONSE_TIMEOUT_MS = 180000;
-            const hasAllMetaTags = (t) => /\[TITLE\]/i.test(t) && /\[KEYWORDS\]/i.test(t)
-              && /\[CATEGORY\]/i.test(t) && /\[DESCRIPTION\]/i.test(t);
-            const deadline = Date.now() + RESPONSE_TIMEOUT_MS;
+            const deadline = Date.now() + 90000;
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -2007,7 +2071,7 @@ jobs:
             while (Date.now() < deadline) {
               await sleep(1500);
               const currentCount = await getResponseCount();
-              const countGrew = currentCount > initialCount;
+              if (currentCount <= initialCount) continue;
 
               const latestText = await geminiPage.evaluate(() => {
                 const selectors = [
@@ -2029,12 +2093,6 @@ jobs:
 
               if (!latestText) continue;
 
-              /* v16: complete reply already rendered - take it right away */
-              if (hasAllMetaTags(latestText)) { responseText = latestText; break; }
-
-              /* reply still incomplete and no new response element yet - keep waiting */
-              if (!countGrew) continue;
-
               if (latestText === lastSeen) {
                 stableCount++;
                 if (stableCount >= 2) { responseText = latestText; break; }
@@ -2044,7 +2102,7 @@ jobs:
               }
             }
 
-            if (!responseText) throw new Error(`Gemini web timeout: no response within ${RESPONSE_TIMEOUT_MS / 1000}s`);
+            if (!responseText) throw new Error('Gemini web timeout: no response within 90s');
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
           }
@@ -2330,18 +2388,20 @@ jobs:
             const validCategories = VALID_IMG_CATS.filter(c => c !== 'OTHER').join(', ');
             const kindContext = KIND_PROMPT_CONTEXT[kind] || KIND_PROMPT_CONTEXT.WALLPAPER;
             const METADATA_PROMPT =
-              `You are an expert image curator and SEO metadata specialist.\n\n` +
+              `You are an expert image curator, SEO metadata specialist and Zedge marketplace compliance reviewer.\n\n${ZEDGE_POLICY_RULES}\n\n` +
               `${kindContext}\n` +
               `Look at the attached image carefully and generate the following metadata:\n` +
               `1. A creative and UNIQUE TITLE (max 25 characters). Use evocative, descriptive words. Avoid generic filler words like "beautiful", "amazing", "stunning". No quotes.\n` +
               `2. 15 relevant, descriptive single-word KEYWORDS (comma-separated). Cover the subject, colors, mood, style, and use-case.\n` +
               `3. The most appropriate CATEGORY selected ONLY from this list: ${validCategories}.\n` +
-              `4. A SHORT description in MAXIMUM 5 WORDS. No punctuation, no full sentences.\n\n` +
+              `4. A SHORT description in MAXIMUM 5 WORDS. No punctuation, no full sentences.\n` +
+              `5. POLICY verdict: write OK if this image is clearly safe and original under the policy above. Otherwise write FLAG: <short reason> — flag any recognizable copyrighted character, franchise art, brand/logo/trademark, celebrity or real identifiable person (selfie, family photo), text watermark, sexual/suggestive content, hate symbol, violence, weapons, drugs, apparent minors, or a stretched / blurry / badly cropped low-quality image.\n\n` +
               `CRITICAL: Format your ENTIRE response EXACTLY like this — no other text outside these tags:\n` +
               `[TITLE]...[/TITLE]\n` +
               `[KEYWORDS]...[/KEYWORDS]\n` +
               `[CATEGORY]...[/CATEGORY]\n` +
-              `[DESCRIPTION]...[/DESCRIPTION]`;
+              `[DESCRIPTION]...[/DESCRIPTION]\n` +
+              `[POLICY]OK or FLAG: reason[/POLICY]`;
 
             const responseText = await callGeminiWeb(METADATA_PROMPT, geminiPage);
 
@@ -2352,42 +2412,19 @@ jobs:
               return match ? match[1].trim() : '';
             };
 
-            // ─── RESPONSE VALIDATION (v13) ──────────────────────────────────────
-            // A healthy Gemini reply carries the [TITLE] / [KEYWORDS] / [CATEGORY] /
-            // [DESCRIPTION] tags. When the session is stale, rate-limited, or the
-            // image never attached, Gemini answers with a short refusal and every
-            // tag is missing. That used to fall back to `Image <key>` + OTHER and
-            // still got written to Firebase as a success, so the item looked "done"
-            // and was never retried again. Fail loudly instead.
-            const REQUIRED_TAGS = ['TITLE', 'KEYWORDS', 'CATEGORY', 'DESCRIPTION'];
-            const foundTags = REQUIRED_TAGS.filter(t => getTagValue(responseText, t));
-            if (foundTags.length < 2) {
-              const preview = String(responseText || '').replace(/\s+/g, ' ').slice(0, 160);
-              throw new Error(`Bad Gemini response - only ${foundTags.length}/4 tags found (${String(responseText || '').length} chars): "${preview}"`);
-            }
-            if (!getTagValue(responseText, 'TITLE')) {
-              throw new Error('Bad Gemini response - [TITLE] tag missing, refusing junk fallback title');
-            }
-
             const title       = cleanTitle(getTagValue(responseText, 'TITLE'))       || `Image ${key.slice(0, 8)}`;
             const tags        = cleanKeywords(getTagValue(responseText, 'KEYWORDS'));
             const category    = cleanCategory(getTagValue(responseText, 'CATEGORY'));
             const description = cleanDescription(getTagValue(responseText, 'DESCRIPTION'));
-
-            // Title parsed down to nothing, or no usable keywords => still junk.
-            if (!title || /^Image /.test(title)) {
-              throw new Error(`Bad Gemini response - unusable title after cleaning ("${title}")`);
-            }
-            if (!tags) {
-              throw new Error('Bad Gemini response - no usable keywords parsed');
-            }
 
             console.log(`  ✨ Title    : "${title}"`);
             console.log(`  🏷️  Tags     : ${tags}`);
             console.log(`  📁 Category : ${category}`);
             console.log(`  📝 Desc     : ${description}`);
 
-            return { title, tags, category, description };
+            const policy = getTagValue(responseText, 'POLICY');
+            console.log(`  🛡️  Policy   : ${policy || '(no verdict)'}`);
+            return { title, tags, category, description, policy };
           }
 
           // ─── MAIN ─────────────────────────────────────────────────────────────────
@@ -2487,6 +2524,7 @@ jobs:
 
           // ─── PROCESS EACH DB TARGET ───────────────────────────────────────────────
           let totalSuccess = 0;
+          let totalHeld = 0;
           let totalFailed  = 0;
 
           for (const db of TARGET_DB_URLS) {
@@ -2518,41 +2556,45 @@ jobs:
               let tmpImagePath = null;
               try {
                 tmpImagePath = await imageToTempFile(record, key, kind);
-
-                // Retry bad/empty Gemini replies (v13) instead of saving junk once.
-                const MAX_META_ATTEMPTS = 3;
-                let metadata = null;
-                let lastMetaErr = null;
-                for (let attempt = 1; attempt <= MAX_META_ATTEMPTS; attempt++) {
-                  try {
-                    metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
-                    lastMetaErr = null;
-                    break;
-                  } catch (metaErr) {
-                    lastMetaErr = metaErr;
-                    console.warn(`  ⚠️ Attempt ${attempt}/${MAX_META_ATTEMPTS} failed: ${metaErr.message}`);
-                    if (attempt < MAX_META_ATTEMPTS) {
-                      /* v16: a timeout already burned the full wait - retry sooner */
-                      const backoffMs = /timeout/i.test(metaErr.message || '') ? 5000 : 10000 * attempt;
-                      console.log(`  ⏳ Cooling down ${backoffMs / 1000}s before retry...`);
-                      await sleep(backoffMs);
-                    }
-                  }
+                let metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                let check = zedgeEnforce(metadata, 'image');
+                if (check.issues.length) {
+                  console.warn(`  🚫 [${db.name}] [${key}] Zedge policy: ${check.issues.join('; ')} — regenerating metadata once`);
+                  await sleep(2000);
+                  metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                  check = zedgeEnforce(metadata, 'image');
                 }
-                if (!metadata) {
-                  throw lastMetaErr || new Error('Metadata generation failed - nothing written to Firebase');
+                const verdict = String(metadata.policy || '').trim();
+                const flag = /^FLAG/i.test(verdict) ? verdict.replace(/^FLAG\s*:?\s*/i, '').trim() || 'flagged by policy review' : '';
+                const patch = {
+                  title: check.meta.title,
+                  tags: check.meta.tags,
+                  category: check.meta.category,
+                  description: check.meta.description,
+                  metadataGeneratedAt: Date.now(),
+                  policyCheckedAt: Date.now()
+                };
+                const reason = flag || (check.issues.length ? `metadata could not be made policy-safe: ${check.issues.join('; ')}` : '');
+                if (reason && (record.status || 'queued') === 'queued') {
+                  // Hold the item: bots only upload status=queued. It appears in the panel/app
+                  // Failed section with the reason; Requeue only if it is your own compliant work.
+                  Object.assign(patch, {
+                    status: 'failed',
+                    policyCheck: 'held',
+                    policyFlag: reason,
+                    error: `Zedge policy hold — ${reason}. Review this item; Requeue only if it is your own original, policy-compliant work (uploading it may suspend the Zedge account).`,
+                    failedAt: Date.now()
+                  });
+                  await firebasePatchMetadata(db.url, IMAGE_QUEUE_PATH, key, patch);
+                  console.warn(`  🛑 [${db.name}] [${key}] HELD (not uploaded): ${reason}`);
+                  totalHeld++;
+                } else {
+                  patch.policyCheck = reason ? 'review' : 'passed';
+                  if (reason) patch.policyFlag = reason;
+                  await firebasePatchMetadata(db.url, IMAGE_QUEUE_PATH, key, patch);
+                  console.log(`  ✅ [${db.name}] [${key}] Metadata patched successfully! (policy ${patch.policyCheck})`);
+                  totalSuccess++;
                 }
-
-                await firebasePatchMetadata(db.url, IMAGE_QUEUE_PATH, key, {
-                  title: metadata.title,
-                  tags: metadata.tags,
-                  category: metadata.category,
-                  description: metadata.description,
-                  metadataGeneratedAt: Date.now()
-                });
-
-                console.log(`  ✅ [${db.name}] [${key}] Metadata patched successfully!`);
-                totalSuccess++;
 
               } catch (err) {
                 console.error(`  ❌ [${db.name}] [${key}] Failed: ${err.message}`);
@@ -2564,8 +2606,8 @@ jobs:
               }
 
               if (i < toProcess.length - 1) {
-                console.log('  ⏳ Waiting 8s before next image...');
-                await sleep(8000);
+                console.log('  ⏳ Waiting 3s before next image...');
+                await sleep(3000);
               }
             }
           }
@@ -2595,6 +2637,7 @@ jobs:
           console.log('============================================================');
           console.log(`✅ Success  : ${totalSuccess}`);
           console.log(`❌ Failed   : ${totalFailed}`);
+          console.log(`🛑 Held     : ${totalHeld} (Zedge policy — see Failed section, Requeue only if compliant)`);
           console.log(`⏭️  Already done: images with full metadata were skipped automatically`);
           console.log('============================================================');
 
