@@ -61,6 +61,7 @@ on:
           - zedge_1
           - zedge_2
           - zedge_3
+          - zedge_4
           - all_accounts
 
       gemini_session:
@@ -102,6 +103,12 @@ jobs:
 
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
+          # v28 security: Firebase database URLs from GitHub Secrets
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
+          ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
+          ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
+          ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
@@ -202,14 +209,19 @@ jobs:
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
-          const FIREBASE_DB_MAP = {
-            zedge_1: 'https://zedge-r2-edward-hermes-default-rtdb.firebaseio.com',
-            zedge_2: 'https://zedge-r2-ryan-hermes-default-rtdb.firebaseio.com',
-            zedge_3: 'https://zedge-r2-christian-hermes-default-rtdb.firebaseio.com'
-          };
+          // v28 security: database URLs come from GitHub Secrets ZEDGEn_DB_URL (never written here).
+          const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
+            zedge_1: process.env.ZEDGE1_DB_URL,
+            zedge_2: process.env.ZEDGE2_DB_URL,
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
+          }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
+          if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
           // ─── R2 WORKER URL ────────────────────────────────────────────────────────
-          const R2_WORKER_URL = 'https://zedgemedia.monjurulgd2001.workers.dev'; // <-- CONFIG: your Cloudflare R2 worker URL
+          // v28 security: R2 worker URL comes from the GitHub secret R2_WORKER_URL
+          const R2_WORKER_URL = (process.env.R2_WORKER_URL || '').trim().replace(/\/+$/, '');
+          if (!R2_WORKER_URL) { console.error('GitHub secret R2_WORKER_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
           // Resolve which DB URLs to target
           let TARGET_DB_URLS;
@@ -218,7 +230,7 @@ jobs:
           } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
             TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
           } else {
-            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_accounts`);
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, zedge_4, all_accounts`);
             process.exit(1);
           }
 
@@ -1601,6 +1613,12 @@ jobs:
 
       - name: 🖼️ Generate Image Metadata & Patch Firebase
         env:
+          # v28 security: Firebase database URLs from GitHub Secrets
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
+          ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
+          ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
+          ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
@@ -1785,11 +1803,14 @@ jobs:
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           // <-- CONFIG: your Firebase Realtime Database URLs (same as in index.html / Core.kt / zedgeN.yml)
-          const FIREBASE_DB_MAP = {
-            zedge_1: 'https://zedge-r2-edward-hermes-default-rtdb.firebaseio.com',
-            zedge_2: 'https://zedge-r2-ryan-hermes-default-rtdb.firebaseio.com',
-            zedge_3: 'https://zedge-r2-christian-hermes-default-rtdb.firebaseio.com'
-          };
+          // v28 security: database URLs come from GitHub Secrets ZEDGEn_DB_URL (never written here).
+          const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
+            zedge_1: process.env.ZEDGE1_DB_URL,
+            zedge_2: process.env.ZEDGE2_DB_URL,
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
+          }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
+          if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
           let TARGET_DB_URLS;
           if (TARGET_ACCOUNT === 'all_accounts' || TARGET_ACCOUNT === 'all_four' || TARGET_ACCOUNT === 'all_three') {
@@ -2783,6 +2804,6 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Mode | Auto-scan (all images missing metadata) |" >> $GITHUB_STEP_SUMMARY
           echo "| Queue path | ${{ github.event.inputs.image_queue_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3, zedge_4) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Image metadata generated via Gemini Web (image upload) and patched back to Firebase." >> $GITHUB_STEP_SUMMARY
