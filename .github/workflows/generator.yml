@@ -765,19 +765,7 @@ jobs:
             };
           }
 
-          // ─── CREDENTIAL & TEMP-MAIL HELPERS (Mail.tm + Fallback) ─────────────────
-          function generateRandomEmail() {
-            const ts  = Date.now().toString().slice(-6);
-            const rnd = Math.random().toString(36).substring(2, 8);
-            const firsts = ['alex', 'jordan', 'taylor', 'morgan', 'casey', 'riley', 'quinn', 'avery'];
-            const lasts  = ['carter', 'bennett', 'hayes', 'parker', 'collins', 'reid', 'foster', 'brooks'];
-            const f = firsts[Math.floor(Math.random() * firsts.length)];
-            const l = lasts[Math.floor(Math.random() * lasts.length)];
-            const domains = ['gmail.com', 'outlook.com', 'yahoo.com', 'icloud.com'];
-            const domain  = domains[Math.floor(Math.random() * domains.length)];
-            return `${f}.${l}.${rnd}${ts}@${domain}`;
-          }
-
+          // ─── CREDENTIAL & MULTI-PROVIDER TEMP-MAIL HELPERS ────────────────────────
           function generateStrongPassword() {
             // High-entropy passphrase + mixed characters that scores 4/4 on WorkOS AuthKit's
             // client-side zxcvbn-ts validator and never appears in HIBP breach lists.
@@ -790,66 +778,154 @@ jobs:
             return `${w1}#${num}!${w2}$${rnd}Q9`;
           }
 
-          // Creates a real disposable inbox via api.mail.tm so if WorkOS AuthKit asks
-          // for an email verification code (OTP), we can read it automatically.
-          async function createTempMailAccount(password) {
-            try {
-              const domRes = await fetch('https://api.mail.tm/domains');
-              if (!domRes.ok) throw new Error(`domains HTTP ${domRes.status}`);
-              const domData = await domRes.json();
-              const domains = domData['hydra:member'] || [];
-              if (!domains.length) throw new Error('No active mail.tm domains');
-              const domain = domains[0].domain;
-              const address = `alex.carter.${Math.random().toString(36).substring(2, 7)}${Date.now().toString().slice(-4)}@${domain}`;
+          // Creates a real disposable inbox using a 3-provider failover chain:
+          //   1. api.mail.tm (with clean lowercase alphanumeric username + simple mailPw so /token never 401s)
+          //   2. api.mail.gw (mirror provider with separate domain pool)
+          //   3. api.guerrillamail.com (session-based disposable inbox)
+          async function createTempMailAccount() {
+            const firsts = ['alex', 'jordan', 'taylor', 'morgan', 'casey', 'riley', 'quinn', 'avery'];
+            const lasts  = ['carter', 'bennett', 'hayes', 'parker', 'collins', 'reid', 'foster', 'brooks'];
+            const f = firsts[Math.floor(Math.random() * firsts.length)];
+            const l = lasts[Math.floor(Math.random() * lasts.length)];
 
-              const accRes = await fetch('https://api.mail.tm/accounts', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ address, password })
-              });
-              if (!accRes.ok) throw new Error(`accounts HTTP ${accRes.status}`);
+            // Try Mail.tm and Mail.gw first
+            for (const apiBase of ['https://api.mail.tm', 'https://api.mail.gw']) {
+              try {
+                const domRes = await fetch(`${apiBase}/domains`);
+                if (!domRes.ok) throw new Error(`domains HTTP ${domRes.status}`);
+                const domData = await domRes.json();
+                const domains = (domData['hydra:member'] || []).filter(d => d.isActive !== false);
+                if (!domains.length) throw new Error('No active domains');
 
-              const tokRes = await fetch('https://api.mail.tm/token', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ address, password })
-              });
-              if (!tokRes.ok) throw new Error(`token HTTP ${tokRes.status}`);
-              const tokData = await tokRes.json();
-              console.log(`  📬 Created real temp-mail inbox: ${address}`);
-              return { email: address, mailToken: tokData.token };
-            } catch (e) {
-              console.warn(`  ⚠️ Mail.tm unavailable (${e.message}) — falling back to standard email.`);
-              return { email: generateRandomEmail(), mailToken: null };
+                const domain = domains[Math.floor(Math.random() * domains.length)].domain;
+                const rnd = Math.random().toString(36).replace(/[^a-z0-9]/g, '').substring(0, 5);
+                const ts  = Date.now().toString().slice(-4);
+                // IMPORTANT: Pure lowercase alphanumeric local part (no dots/underscores) + simple
+                // alphanumeric password avoids Mail.tm/Mail.gw normalization mismatches that cause /token 401!
+                const rawAddress = `${f}${l}${rnd}${ts}@${domain}`.toLowerCase();
+                const mailPw = `MailPass${rnd}${ts}A1`;
+
+                const accRes = await fetch(`${apiBase}/accounts`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                  body: JSON.stringify({ address: rawAddress, password: mailPw })
+                });
+                if (!accRes.ok) {
+                  const errTxt = await accRes.text().catch(() => '');
+                  throw new Error(`accounts HTTP ${accRes.status}: ${errTxt.slice(0, 100)}`);
+                }
+                const accData = await accRes.json();
+                const canonicalAddress = (accData.address || rawAddress).toLowerCase().trim();
+
+                // Brief pause so account creation commits before requesting JWT token
+                await sleep(1000);
+
+                let tokData = null;
+                for (let tTry = 1; tTry <= 2; tTry++) {
+                  const tokRes = await fetch(`${apiBase}/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ address: canonicalAddress, password: mailPw })
+                  });
+                  if (tokRes.ok) {
+                    tokData = await tokRes.json();
+                    break;
+                  }
+                  await sleep(1200);
+                }
+                if (!tokData?.token) throw new Error('token endpoint did not return token');
+
+                console.log(`  📬 Created real temp-mail inbox (${apiBase}): ${canonicalAddress}`);
+                return { provider: 'mailtm', apiBase, email: canonicalAddress, mailToken: tokData.token };
+              } catch (e) {
+                console.warn(`  ⚠️ ${apiBase} failed (${e.message}) — trying next temp-mail provider...`);
+              }
             }
+
+            // Provider 3 fallback: GuerrillaMail JSON API
+            try {
+              const gmRes = await fetch('https://api.guerrillamail.com/ajax.php?f=get_email_address&lang=en');
+              if (!gmRes.ok) throw new Error(`HTTP ${gmRes.status}`);
+              const gmData = await gmRes.json();
+              if (gmData?.email_addr && gmData?.sid_token) {
+                console.log(`  📬 Created GuerrillaMail inbox: ${gmData.email_addr}`);
+                return { provider: 'guerrilla', email: gmData.email_addr, mailToken: gmData.sid_token };
+              }
+            } catch (e) {
+              console.warn(`  ⚠️ GuerrillaMail failed (${e.message})`);
+            }
+
+            throw new Error('All temp-mail providers failed to create an inbox.');
           }
 
-          async function pollTempMailForOtp(mailToken, timeoutMs = 45000) {
-            if (!mailToken) return null;
+          // Extracts a 6-digit verification code from email subject/text/html (stripping HTML/CSS first)
+          function extractSixDigitOtp(subject = '', intro = '', text = '', html = '') {
+            const cleanHtml = String(html || '')
+              .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+              .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/&nbsp;/gi, ' ')
+              .replace(/\s+/g, ' ');
+            // Check subject, intro, plain text first (least noise), then stripped HTML
+            for (const src of [subject, intro, text, cleanHtml]) {
+              if (!src) continue;
+              const m = String(src).match(/\b(\d{6})\b/);
+              if (m) return m[1];
+            }
+            return null;
+          }
+
+          async function pollTempMailForOtp(inbox, timeoutMs = 60000) {
+            if (!inbox || !inbox.mailToken) return null;
             const deadline = Date.now() + timeoutMs;
+            console.log(`  ⏳ Polling ${inbox.provider} inbox (${inbox.email}) for 6-digit verification code...`);
+
             while (Date.now() < deadline) {
               try {
-                const res = await fetch('https://api.mail.tm/messages', {
-                  headers: { 'Authorization': `Bearer ${mailToken}` }
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  const msgs = data['hydra:member'] || [];
-                  if (msgs.length > 0) {
-                    const msgId = msgs[0].id;
-                    const detailRes = await fetch(`https://api.mail.tm/messages/${msgId}`, {
-                      headers: { 'Authorization': `Bearer ${mailToken}` }
-                    });
-                    if (detailRes.ok) {
-                      const detail = await detailRes.json();
-                      const text = `${detail.subject || ''} ${detail.intro || ''} ${detail.text || ''}`;
-                      const codeMatch = text.match(/\b(\d{6})\b/);
-                      if (codeMatch) return codeMatch[1];
+                if (inbox.provider === 'mailtm') {
+                  const res = await fetch(`${inbox.apiBase}/messages`, {
+                    headers: { 'Authorization': `Bearer ${inbox.mailToken}`, 'Accept': 'application/json' }
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    const msgs = Array.isArray(data) ? data : (data['hydra:member'] || []);
+                    for (const msg of msgs) {
+                      // Quick check on subject/intro before fetching full message
+                      const quickCode = extractSixDigitOtp(msg.subject, msg.intro, '', '');
+                      if (quickCode) return quickCode;
+
+                      const detailRes = await fetch(`${inbox.apiBase}/messages/${msg.id}`, {
+                        headers: { 'Authorization': `Bearer ${inbox.mailToken}`, 'Accept': 'application/json' }
+                      });
+                      if (detailRes.ok) {
+                        const detail = await detailRes.json();
+                        const htmlStr = Array.isArray(detail.html) ? detail.html.join(' ') : (detail.html || '');
+                        const code = extractSixDigitOtp(detail.subject, detail.intro, detail.text, htmlStr);
+                        if (code) return code;
+                      }
+                    }
+                  }
+                } else if (inbox.provider === 'guerrilla') {
+                  const res = await fetch(`https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0&sid_token=${encodeURIComponent(inbox.mailToken)}`);
+                  if (res.ok) {
+                    const data = await res.json();
+                    const list = data?.list || [];
+                    for (const msg of list) {
+                      if (/guerrillamail/i.test(msg.mail_from || '')) continue; // skip welcome email
+                      const quickCode = extractSixDigitOtp(msg.mail_subject, msg.mail_excerpt, '', '');
+                      if (quickCode) return quickCode;
+
+                      const detailRes = await fetch(`https://api.guerrillamail.com/ajax.php?f=fetch_email&email_id=${msg.mail_id}&sid_token=${encodeURIComponent(inbox.mailToken)}`);
+                      if (detailRes.ok) {
+                        const detail = await detailRes.json();
+                        const code = extractSixDigitOtp(detail.mail_subject, detail.mail_excerpt, '', detail.mail_body);
+                        if (code) return code;
+                      }
                     }
                   }
                 }
               } catch {}
-              await sleep(2500);
+              await sleep(3000);
             }
             return null;
           }
@@ -905,15 +981,7 @@ jobs:
             await sleep(250 + Math.floor(Math.random() * 150));
           }
 
-          // ─── AUTO ACCOUNT CREATION (Patchright + Real Chrome + WARP Proxy) ─────────
-          // WorkOS Radar returns "Access blocked, please contact support." if it detects:
-          //   1. Vanilla Playwright's CDP Runtime.enable leak
-          //   2. Spoofed Windows User-Agent on a Linux Xvfb platform (OS mismatch)
-          //   3. Monkey-patched window.fetch / XMLHttpRequest via addInitScript
-          //   4. Synthetic untrusted DOM clicks (el.click() inside page.evaluate)
-          //   5. Flagged Microsoft Azure datacenter IP on GitHub Actions
-          // We solve all 5 by using Patchright + real Google Chrome + native Linux UA +
-          // zero DOM monkey-patching on authkit.app + hardware mouse clicks + Cloudflare WARP proxy.
+          // ─── AUTO ACCOUNT CREATION (Patchright + Real Chrome + WARP + OTP) ─────────
           async function createStableAudioAccount() {
             let patchrightChromium = null;
             try {
@@ -927,23 +995,27 @@ jobs:
             }
 
             const warpProxy = (process.env.WARP_PROXY || '').trim();
-            // 3-attempt matrix:
-            // Attempt 1: WARP proxy (if active) + Standard Gmail/Outlook address
-            // Attempt 2: WARP proxy (if active) + Real Mail.tm inbox (for OTP)
-            // Attempt 3: Direct connection + Standard Gmail/Outlook address
+            // All attempts use a real Temp-Mail inbox because WorkOS AuthKit always asks
+            // "Verify your email" (6-digit OTP) right after /sign-up/password!
             const strategies = [
-              { useWarp: !!warpProxy, useTempMail: false, label: warpProxy ? 'WARP Proxy + Standard Email' : 'Direct + Standard Email' },
-              { useWarp: !!warpProxy, useTempMail: true,  label: warpProxy ? 'WARP Proxy + Temp-Mail Inbox' : 'Direct + Temp-Mail Inbox' },
-              { useWarp: false,       useTempMail: false, label: 'Direct Connection + Standard Email' }
+              { useWarp: !!warpProxy, label: warpProxy ? 'WARP Proxy + Real Temp-Mail OTP' : 'Direct + Real Temp-Mail OTP' },
+              { useWarp: !!warpProxy, label: warpProxy ? 'WARP Proxy + Real Temp-Mail OTP (Retry)' : 'Direct + Real Temp-Mail OTP (Retry)' },
+              { useWarp: false,       label: 'Direct Connection + Real Temp-Mail OTP' }
             ];
 
             for (let idx = 0; idx < strategies.length; idx++) {
               const strat = strategies[idx];
               const attempt = idx + 1;
               const password = generateStrongPassword();
-              const { email, mailToken } = strat.useTempMail
-                ? await createTempMailAccount(password)
-                : { email: generateRandomEmail(), mailToken: null };
+              let inbox = null;
+              try {
+                inbox = await createTempMailAccount();
+              } catch (mailErr) {
+                console.warn(`  ⚠️ Could not create temp-mail inbox on attempt ${attempt}: ${mailErr.message}`);
+                if (attempt < strategies.length) continue;
+                throw mailErr;
+              }
+              const { email } = inbox;
 
               console.log(`\n  🤖 AUTO ACCOUNT CREATION STARTED (Attempt ${attempt}/${strategies.length}: ${strat.label})`);
               console.log(`  📧 Email   : ${email}`);
@@ -973,7 +1045,6 @@ jobs:
                 try {
                   context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
                 } catch {
-                  // Fallback if 'chrome' channel binary wasn't installed; use bundled patched chromium
                   delete launchOpts.channel;
                   context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
                 }
@@ -1028,7 +1099,6 @@ jobs:
                 await page.goto('https://stableaudio.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await sleep(2500 + Math.floor(Math.random() * 1000));
 
-                //Gentle human mouse movement on landing page
                 await page.mouse.move(300 + Math.random() * 200, 250 + Math.random() * 150, { steps: 10 });
                 await sleep(500);
 
@@ -1046,10 +1116,8 @@ jobs:
                 const emailLoc = page.locator('input[name="email"], input[type="email"], input[autocomplete="email"]').first();
                 await emailLoc.waitFor({ state: 'visible', timeout: 20000 });
 
-                // Dwell slightly like a real user reading the form
                 await sleep(800 + Math.floor(Math.random() * 600));
 
-                // Fill optional first/last name if visible
                 const firstLoc = page.locator('input[name="first_name"], input[name="firstName"]').first();
                 if (await firstLoc.isVisible().catch(() => false)) {
                   await humanType(page, firstLoc, 'Alex');
@@ -1071,7 +1139,6 @@ jobs:
                   const continueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), form button[type="submit"]').first();
                   await humanClick(page, continueBtn);
 
-                  // Wait for password field on /sign-up/password
                   console.log('  🔑 Step 5: Waiting for /sign-up/password screen...');
                   await passLoc.waitFor({ state: 'visible', timeout: 20000 });
                   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
@@ -1087,19 +1154,23 @@ jobs:
                 const passContinueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), button[type="submit"]:has-text("Sign up")').first();
                 await humanClick(page, passContinueBtn);
 
-                // Wait up to 8s to see if we redirect, get an OTP screen, or get an alert
+                // Wait up to 8s to transition away from /sign-up/password (to /email-verification or stableaudio.com)
                 for (let w = 0; w < 16; w++) {
                   await sleep(500);
                   if (isStableAudioHost(page.url()) || capturedToken) break;
                   if (!page.url().includes('/sign-up/password')) break;
                 }
 
-                // Check if WorkOS Radar showed an alert on /sign-up/password
+                // Check for REAL error alerts (specifically ignore "Verify your email", which is the OTP screen!)
                 const alertLoc = page.locator('[role="alert"], .ak-Error, [data-accent-color="red"]').first();
+                let isVerifyEmailScreen = false;
                 if (!isStableAudioHost(page.url()) && await alertLoc.isVisible().catch(() => false)) {
                   const alertText = (await alertLoc.innerText().catch(() => '')).trim();
-                  if (alertText) {
-                    console.warn(`  ⚠️ AuthKit alert on attempt ${attempt}: "${alertText}"`);
+                  if (/verify your email|verification code|check your email|enter the.*code|sent.*code/i.test(alertText)) {
+                    isVerifyEmailScreen = true;
+                    console.log(`  📩 AuthKit transitioned to Email Verification screen ("${alertText}")!`);
+                  } else if (alertText && /blocked|contact support|invalid|disposable|not allowed|already|error|weak/i.test(alertText)) {
+                    console.warn(`  ⚠️ AuthKit error alert on attempt ${attempt}: "${alertText}"`);
                     if (attempt < strategies.length) {
                       console.log('  🔄 Switching to next strategy...');
                       continue;
@@ -1108,32 +1179,61 @@ jobs:
                   }
                 }
 
-                // ── Step 7b: Handle optional email OTP verification screen ───────────
-                const otpLoc = page.locator('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]').first();
-                if (!isStableAudioHost(page.url()) && (await otpLoc.isVisible().catch(() => false) || page.url().includes('email-verification'))) {
-                  console.log('  📩 Step 7b: Email verification screen detected...');
-                  if (!mailToken) {
-                    console.warn('  ⚠️ OTP requested on non-temp-mail attempt — switching to Temp-Mail strategy...');
+                // ── Step 7b: Handle "Verify your email" (6-digit OTP screen) ─────────
+                const otpLoc = page.locator('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[maxlength="1"], input[maxlength="6"]').first();
+                const onVerifyPage =
+                  isVerifyEmailScreen ||
+                  page.url().includes('email-verification') ||
+                  page.url().includes('verify') ||
+                  (await otpLoc.isVisible().catch(() => false));
+
+                if (!isStableAudioHost(page.url()) && onVerifyPage) {
+                  console.log(`  📩 Step 7b: On Email Verification screen (${page.url().split('?')[0]}) — waiting for OTP email...`);
+                  const otp = await pollTempMailForOtp(inbox, 60000);
+                  if (!otp) {
+                    console.warn(`  ⚠️ Did not receive OTP email within 60s on attempt ${attempt}.`);
                     if (attempt < strategies.length) continue;
+                    throw new Error('Timed out waiting for 6-digit OTP email from WorkOS AuthKit.');
+                  }
+
+                  console.log(`  🔢 Received 6-digit OTP code: ${otp} — entering code into AuthKit...`);
+                  // Wait briefly for OTP inputs to be ready
+                  await sleep(800);
+                  if (await otpLoc.isVisible().catch(() => false)) {
+                    await humanClick(page, otpLoc);
                   } else {
-                    const otp = await pollTempMailForOtp(mailToken, 40000);
-                    if (otp) {
-                      console.log(`  🔢 Entering OTP code: ${otp}...`);
-                      await humanType(page, otpLoc, otp);
-                      const verifyBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]').first();
-                      if (await verifyBtn.isVisible().catch(() => false)) {
-                        await humanClick(page, verifyBtn);
-                      }
-                      await sleep(3000);
+                    const anyInput = page.locator('input:not([type="hidden"])').first();
+                    if (await anyInput.isVisible().catch(() => false)) {
+                      await humanClick(page, anyInput);
                     }
                   }
+                  await sleep(250);
+
+                  // Type the 6 digits with realistic human delay (Radix UI OTP auto-advances across the 6 boxes)
+                  for (const digit of otp) {
+                    await page.keyboard.type(digit, { delay: 75 + Math.floor(Math.random() * 50) });
+                    await sleep(60);
+                  }
+                  await sleep(1500);
+
+                  // If still on authkit.app (in case it didn't auto-submit on the 6th digit), click Verify / Continue
+                  if (!isStableAudioHost(page.url())) {
+                    const verifyBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Verify"), button[type="submit"]:has-text("Continue"), button[type="submit"]').first();
+                    if (await verifyBtn.isVisible().catch(() => false)) {
+                      console.log('  🖱️  Clicking Verify/Continue button to submit OTP...');
+                      await humanClick(page, verifyBtn).catch(() => {});
+                    } else {
+                      await page.keyboard.press('Enter').catch(() => {});
+                    }
+                  }
+                  await sleep(3000);
                 }
 
                 // ── Step 8: Wait for redirect to stableaudio.com host ────────────────
                 if (!isStableAudioHost(page.url())) {
                   console.log('  ⏳ Step 8: Waiting for redirect to stableaudio.com host...');
                   try {
-                    await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 35000 });
+                    await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 40000 });
                     console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
                   } catch {
                     console.warn(`  ⚠️ Did not reach stableaudio.com on attempt ${attempt} (at: ${page.url()})`);
@@ -1160,13 +1260,13 @@ jobs:
                   const cbCount = await checkboxes.count().catch(() => 0);
                   for (let c = 0; c < cbCount; c++) {
                     await checkboxes.nth(c).click().catch(() => {});
-                    await sleep(200);
+                    await sleep(250);
                   }
-                  const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("Agree"), button:has-text("Continue"), button:has-text("Get started")').first();
+                  const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("Agree"), button:has-text("Continue"), button:has-text("Get started"), button[type="submit"]').first();
                   if (await acceptBtn.isVisible().catch(() => false)) {
                     await humanClick(page, acceptBtn).catch(() => {});
                   }
-                  await sleep(2500);
+                  await sleep(3000);
                 }
 
                 // ── Step 8c: Poll for token once on stableaudio.com ──────────────────
@@ -1175,7 +1275,6 @@ jobs:
                 let navigatedToGenerate = false;
 
                 while (!capturedToken && Date.now() < tokenDeadline) {
-                  // Only evaluate storage when safely on stableaudio.com
                   if (isStableAudioHost(page.url())) {
                     const storageToken = await page.evaluate(() => {
                       const scanStore = (store) => {
