@@ -69,6 +69,11 @@ on:
         required: false
         default: ""
 
+      stable_audio_token:
+        description: "🎵 Stable Audio Token (optional — leave empty to auto-create account)"
+        required: false
+        default: ""
+
 jobs:
   generate-ringtones:
     if: github.event.inputs.mode == 'ringtone'
@@ -133,7 +138,7 @@ jobs:
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
           ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
-          STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
+          STABLE_AUDIO_TOKEN: ${{ github.event.inputs.stable_audio_token || secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           AUTO_GENERATE_COUNT: ${{ github.event.inputs.auto_generate_count }}
@@ -1197,32 +1202,115 @@ jobs:
                   }
 
                   console.log(`  🔢 Received 6-digit OTP code: ${otp} — entering code into AuthKit...`);
-                  // Wait briefly for OTP inputs to be ready
-                  await sleep(800);
-                  if (await otpLoc.isVisible().catch(() => false)) {
-                    await humanClick(page, otpLoc);
-                  } else {
-                    const anyInput = page.locator('input:not([type="hidden"])').first();
-                    if (await anyInput.isVisible().catch(() => false)) {
-                      await humanClick(page, anyInput);
-                    }
-                  }
-                  await sleep(250);
+                  await sleep(1000);
 
-                  // Type the 6 digits with realistic human delay (Radix UI OTP auto-advances across the 6 boxes)
-                  for (const digit of otp) {
-                    await page.keyboard.type(digit, { delay: 75 + Math.floor(Math.random() * 50) });
-                    await sleep(60);
+                  // Strategy 1: DOM Property & Event Injection (handles transparent input-otp, 6 boxes, and paste event)
+                  try {
+                    await page.evaluate((code) => {
+                      const allInputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                        const t = (el.getAttribute('type') || '').toLowerCase();
+                        return t !== 'hidden' && t !== 'checkbox' && t !== 'radio';
+                      });
+
+                      // Case 1A: 6 individual boxes
+                      if (allInputs.length === 6) {
+                        for (let i = 0; i < 6; i++) {
+                          const inp = allInputs[i];
+                          inp.focus();
+                          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                          if (setter) setter.call(inp, code[i]);
+                          else inp.value = code[i];
+                          inp.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                          inp.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                          inp.dispatchEvent(new KeyboardEvent('keyup', { key: code[i], bubbles: true }));
+                        }
+                      }
+
+                      // Case 1B: Single input (input-otp, name="code", etc.)
+                      const targetInput = document.querySelector('input[autocomplete="one-time-code"], input[name="code"], input[data-input-otp], input[inputmode="numeric"]') || (allInputs.length === 1 ? allInputs[0] : null);
+                      if (targetInput) {
+                        targetInput.focus();
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) setter.call(targetInput, code);
+                        else targetInput.value = code;
+                        targetInput.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                        targetInput.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                      }
+
+                      // Case 1C: Clipboard paste event
+                      const pasteTarget = targetInput || allInputs[0] || document.querySelector('[data-input-otp-container], form') || document.activeElement;
+                      if (pasteTarget) {
+                        const dt = new DataTransfer();
+                        dt.setData('text/plain', code);
+                        const pasteEvt = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+                        pasteTarget.dispatchEvent(pasteEvt);
+                      }
+                    }, otp);
+                  } catch (e) {
+                    console.warn(`  ⚠️ DOM injection notice: ${e.message}`);
                   }
+
+                  // Strategy 2: Native Playwright Focus & Type/Fill
+                  try {
+                    const separateInputs = page.locator('input[maxlength="1"]');
+                    const sepCount = await separateInputs.count().catch(() => 0);
+                    if (sepCount === 6) {
+                      for (let i = 0; i < 6; i++) {
+                        const inp = separateInputs.nth(i);
+                        await inp.click({ force: true }).catch(() => {});
+                        await inp.fill(otp[i]).catch(() => {});
+                        await sleep(50);
+                      }
+                    } else {
+                      const inputToClick = page.locator('input:not([type="hidden"]), [data-input-otp-container], [data-input-otp-slot], form').first();
+                      if (await inputToClick.isVisible().catch(() => false)) {
+                        await humanClick(page, inputToClick).catch(() => inputToClick.click({ force: true }));
+                      } else {
+                        await page.locator('input').first().focus({ force: true }).catch(() => {});
+                      }
+                      await sleep(200);
+                      for (const digit of otp) {
+                        await page.keyboard.type(digit, { delay: 60 + Math.floor(Math.random() * 40) });
+                        await sleep(40);
+                      }
+                    }
+                  } catch (typeErr) {
+                    console.warn(`  ⚠️ Keystroke entry: ${typeErr.message}`);
+                  }
+
                   await sleep(1500);
 
-                  // If still on authkit.app (in case it didn't auto-submit on the 6th digit), click Verify / Continue
+                  // ── Submit OTP ──
                   if (!isStableAudioHost(page.url())) {
-                    const verifyBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Verify"), button[type="submit"]:has-text("Continue"), button[type="submit"]').first();
-                    if (await verifyBtn.isVisible().catch(() => false)) {
-                      console.log('  🖱️  Clicking Verify/Continue button to submit OTP...');
-                      await humanClick(page, verifyBtn).catch(() => {});
-                    } else {
+                    const submitSelectors = [
+                      'button[type="submit"]',
+                      'button:has-text("Verify")',
+                      'button:has-text("Continue")',
+                      'button:has-text("Confirm")',
+                      'button:has-text("Submit")',
+                      'button.ak-PrimaryButton',
+                      '.ak-Button--primary',
+                      '[data-testid="submit-button"]'
+                    ];
+                    let clicked = false;
+                    for (const sel of submitSelectors) {
+                      const btn = page.locator(sel).first();
+                      if (await btn.isVisible().catch(() => false)) {
+                        console.log(`  🖱️  Clicking submit button (${sel})...`);
+                        await humanClick(page, btn).catch(() => btn.click({ force: true }));
+                        clicked = true;
+                        break;
+                      }
+                    }
+                    if (!clicked) {
+                      console.log('  🖱️  Submitting form via requestSubmit / Enter key...');
+                      await page.evaluate(() => {
+                        const form = document.querySelector('form');
+                        if (form) {
+                          if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                          else form.submit();
+                        }
+                      }).catch(() => {});
                       await page.keyboard.press('Enter').catch(() => {});
                     }
                   }
@@ -1236,7 +1324,13 @@ jobs:
                     await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 40000 });
                     console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
                   } catch {
-                    console.warn(`  ⚠️ Did not reach stableaudio.com on attempt ${attempt} (at: ${page.url()})`);
+                    const diag = await page.evaluate(() => {
+                      const alert = document.querySelector('[role="alert"], .ak-Error, [data-accent-color="red"], .error-message');
+                      const text = (document.body?.innerText || '').slice(0, 300).replace(/\s+/g, ' ');
+                      return { alert: alert ? alert.innerText.trim() : null, text };
+                    }).catch(() => ({ alert: null, text: '' }));
+                    if (diag.alert) console.warn(`  ⚠️ AuthKit alert on attempt ${attempt}: "${diag.alert}"`);
+                    console.warn(`  ⚠️ Did not reach stableaudio.com on attempt ${attempt} (at: ${page.url()}) [Page: "${diag.text}"]`);
                     if (attempt < strategies.length) continue;
                   }
                 } else {
