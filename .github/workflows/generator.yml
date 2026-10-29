@@ -84,8 +84,32 @@ jobs:
       - name: 📥 Install Dependencies
         run: |
           npm init -y
-          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth
+          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth patchright
           npx playwright install chromium --with-deps
+          npx patchright install chrome --with-deps || npx playwright install chrome --with-deps || true
+
+      - name: 🛡️ Start Cloudflare WARP SOCKS5 Proxy (Bypass WorkOS Datacenter IP Block)
+        continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${CODENAME} main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -qq || (echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && sudo apt-get update -qq)
+          sudo apt-get install -y cloudflare-warp
+          sudo warp-cli --accept-tos registration new || sudo warp-cli --accept-tos register || true
+          sudo warp-cli --accept-tos mode proxy || sudo warp-cli --accept-tos set-mode proxy || true
+          sudo warp-cli --accept-tos proxy port 40000 || sudo warp-cli --accept-tos set-proxy-port 40000 || true
+          sudo warp-cli --accept-tos connect || true
+          for i in 1 2 3 4 5; do
+            sleep 2
+            TRACE=$(curl -x socks5h://127.0.0.1:40000 -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace || true)
+            if echo "$TRACE" | grep -q "warp=on\|warp=plus"; then
+              echo "✅ Cloudflare WARP proxy active on socks5://127.0.0.1:40000"
+              echo "$TRACE" | grep -E "ip=|warp=|loc="
+              echo "WARP_PROXY=socks5://127.0.0.1:40000" >> $GITHUB_ENV
+              break
+            fi
+          done
 
       - name: 🎛️ Install ffmpeg (required for silence trim + volume boost)
         run: |
@@ -744,10 +768,14 @@ jobs:
           // ─── CREDENTIAL & TEMP-MAIL HELPERS (Mail.tm + Fallback) ─────────────────
           function generateRandomEmail() {
             const ts  = Date.now().toString().slice(-6);
-            const rnd = Math.random().toString(36).substring(2, 9);
-            const domains = ['gmail.com', 'outlook.com', 'yahoo.com', 'hotmail.com'];
+            const rnd = Math.random().toString(36).substring(2, 8);
+            const firsts = ['alex', 'jordan', 'taylor', 'morgan', 'casey', 'riley', 'quinn', 'avery'];
+            const lasts  = ['carter', 'bennett', 'hayes', 'parker', 'collins', 'reid', 'foster', 'brooks'];
+            const f = firsts[Math.floor(Math.random() * firsts.length)];
+            const l = lasts[Math.floor(Math.random() * lasts.length)];
+            const domains = ['gmail.com', 'outlook.com', 'yahoo.com', 'icloud.com'];
             const domain  = domains[Math.floor(Math.random() * domains.length)];
-            return `alex.carter.${rnd}${ts}@${domain}`;
+            return `${f}.${l}.${rnd}${ts}@${domain}`;
           }
 
           function generateStrongPassword() {
@@ -772,7 +800,7 @@ jobs:
               const domains = domData['hydra:member'] || [];
               if (!domains.length) throw new Error('No active mail.tm domains');
               const domain = domains[0].domain;
-              const address = `alex_${Math.random().toString(36).substring(2, 8)}${Date.now().toString().slice(-5)}@${domain}`;
+              const address = `alex.carter.${Math.random().toString(36).substring(2, 7)}${Date.now().toString().slice(-4)}@${domain}`;
 
               const accRes = await fetch('https://api.mail.tm/accounts', {
                 method: 'POST',
@@ -839,146 +867,122 @@ jobs:
             }
           }
 
-          // Helper to fill an input reliably across React / Radix UI / WorkOS AuthKit SSR hydration
-          async function fillAuthKitInput(page, selector, value) {
-            const el = await page.waitForSelector(selector, { state: 'visible', timeout: 15000 });
-            await el.click({ force: true });
-            await sleep(150);
-            await page.keyboard.press('Control+a');
-            await page.keyboard.press('Backspace');
-            await sleep(100);
-            // Type character by character so client-side validators (like zxcvbn-ts) fire onKeyDown/onInput
-            await page.keyboard.type(value, { delay: 20 });
-            await sleep(150);
-            // Also verify via native value setter in case hydration cleared a character
-            await page.evaluate(({ sel, val }) => {
-              const inputs = Array.from(document.querySelectorAll(sel)).filter(i => i.offsetParent !== null);
-              const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-              for (const inp of inputs) {
-                if (inp.value !== val && setter) {
-                  setter.call(inp, val);
-                }
-                inp.dispatchEvent(new Event('input',  { bubbles: true }));
-                inp.dispatchEvent(new Event('change', { bubbles: true }));
-                inp.dispatchEvent(new Event('blur',   { bubbles: true }));
-              }
-            }, { sel: selector, val: value }).catch(() => {});
-          }
-
-          // Helper to click the primary submit button inside the active AuthKit form
-          async function submitAuthKitForm(page, inputSelector) {
-            const clickedSpecific = await page.evaluate((inpSel) => {
-              const inp = Array.from(document.querySelectorAll(inpSel)).find(i => i.offsetParent !== null);
-              const form = inp ? inp.closest('form') : document.querySelector('form');
-              if (form) {
-                // Prefer primary Continue / Sign up submit button inside the same form (avoid "Edit" email buttons)
-                const buttons = Array.from(form.querySelectorAll('button[type="submit"], button:not([type])'))
-                  .filter(b => b.offsetParent !== null && !b.disabled);
-                const primary = buttons.find(b => /continue|sign up|create|submit|next|verify/i.test(b.textContent.trim())) || buttons[buttons.length - 1];
-                if (primary) {
-                  primary.click();
-                  return `form button "${primary.textContent.trim()}"`;
-                }
-              }
-              const anyBtn = Array.from(document.querySelectorAll('button.ak-PrimaryButton, button[type="submit"]'))
-                .filter(b => b.offsetParent !== null && !b.disabled)
-                .find(b => !/edit|back|change/i.test(b.textContent.trim()));
-              if (anyBtn) {
-                anyBtn.click();
-                return `fallback button "${anyBtn.textContent.trim()}"`;
-              }
-              return null;
-            }, inputSelector).catch(() => null);
-
-            if (clickedSpecific) {
-              console.log(`    🖱️  Clicked ${clickedSpecific}`);
+          // ── Human-like Hardware Mouse & Keyboard Helpers (isTrusted: true) ─────────
+          // WorkOS Radar blocks synthetic DOM element.click() (where event.isTrusted === false
+          // and clientX/clientY === 0). These helpers generate real browser pointer/mouse paths.
+          async function humanClick(page, locator) {
+            await locator.waitFor({ state: 'visible', timeout: 15000 });
+            const box = await locator.boundingBox();
+            if (box) {
+              const targetX = box.x + box.width * (0.3 + Math.random() * 0.4);
+              const targetY = box.y + box.height * (0.3 + Math.random() * 0.4);
+              await page.mouse.move(
+                Math.max(10, targetX - 80 + Math.random() * 60),
+                Math.max(10, targetY - 60 + Math.random() * 40),
+                { steps: 8 }
+              );
+              await sleep(80 + Math.floor(Math.random() * 90));
+              await page.mouse.move(targetX, targetY, { steps: 10 });
+              await sleep(90 + Math.floor(Math.random() * 120));
+              await page.mouse.down();
+              await sleep(55 + Math.floor(Math.random() * 75));
+              await page.mouse.up();
             } else {
-              await page.keyboard.press('Enter').catch(() => {});
-              console.log(`    ⌨️  Pressed Enter to submit`);
+              await locator.click();
             }
           }
 
-          // ─── AUTO ACCOUNT CREATION (Playwright — supports WorkOS AuthKit + Auth0) ──
-          async function createStableAudioAccount() {
-            const { chromium } = await import('playwright-extra');
-            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
-            chromium.use(StealthPlugin());
+          async function humanType(page, locator, text) {
+            await humanClick(page, locator);
+            await sleep(180 + Math.floor(Math.random() * 150));
+            await page.keyboard.press('Control+a');
+            await sleep(60);
+            await page.keyboard.press('Backspace');
+            await sleep(120);
+            for (const ch of text) {
+              await page.keyboard.type(ch, { delay: 35 + Math.floor(Math.random() * 55) });
+            }
+            await sleep(250 + Math.floor(Math.random() * 150));
+          }
 
-            // Try up to 2 strategies:
-            // Strategy 1: Real Mail.tm inbox (supports OTP if AuthKit asks for email verification)
-            // Strategy 2: Standard Gmail/Outlook address (in case WorkOS Radar blocks disposable mail.tm domains)
-            for (let attempt = 1; attempt <= 2; attempt++) {
+          // ─── AUTO ACCOUNT CREATION (Patchright + Real Chrome + WARP Proxy) ─────────
+          // WorkOS Radar returns "Access blocked, please contact support." if it detects:
+          //   1. Vanilla Playwright's CDP Runtime.enable leak
+          //   2. Spoofed Windows User-Agent on a Linux Xvfb platform (OS mismatch)
+          //   3. Monkey-patched window.fetch / XMLHttpRequest via addInitScript
+          //   4. Synthetic untrusted DOM clicks (el.click() inside page.evaluate)
+          //   5. Flagged Microsoft Azure datacenter IP on GitHub Actions
+          // We solve all 5 by using Patchright + real Google Chrome + native Linux UA +
+          // zero DOM monkey-patching on authkit.app + hardware mouse clicks + Cloudflare WARP proxy.
+          async function createStableAudioAccount() {
+            let patchrightChromium = null;
+            try {
+              const pr = await import('patchright');
+              patchrightChromium = pr.chromium;
+              console.log('  🛡️ Using Patchright (CDP-patched undetected Chromium driver)');
+            } catch {
+              const pw = await import('playwright');
+              patchrightChromium = pw.chromium;
+              console.log('  ⚠️ Patchright not found — falling back to Playwright Chromium');
+            }
+
+            const warpProxy = (process.env.WARP_PROXY || '').trim();
+            // 3-attempt matrix:
+            // Attempt 1: WARP proxy (if active) + Standard Gmail/Outlook address
+            // Attempt 2: WARP proxy (if active) + Real Mail.tm inbox (for OTP)
+            // Attempt 3: Direct connection + Standard Gmail/Outlook address
+            const strategies = [
+              { useWarp: !!warpProxy, useTempMail: false, label: warpProxy ? 'WARP Proxy + Standard Email' : 'Direct + Standard Email' },
+              { useWarp: !!warpProxy, useTempMail: true,  label: warpProxy ? 'WARP Proxy + Temp-Mail Inbox' : 'Direct + Temp-Mail Inbox' },
+              { useWarp: false,       useTempMail: false, label: 'Direct Connection + Standard Email' }
+            ];
+
+            for (let idx = 0; idx < strategies.length; idx++) {
+              const strat = strategies[idx];
+              const attempt = idx + 1;
               const password = generateStrongPassword();
-              const { email, mailToken } = attempt === 1
+              const { email, mailToken } = strat.useTempMail
                 ? await createTempMailAccount(password)
                 : { email: generateRandomEmail(), mailToken: null };
 
-              console.log(`\n  🤖 AUTO ACCOUNT CREATION STARTED (Attempt ${attempt}/2)`);
+              console.log(`\n  🤖 AUTO ACCOUNT CREATION STARTED (Attempt ${attempt}/${strategies.length}: ${strat.label})`);
               console.log(`  📧 Email   : ${email}`);
               console.log(`  🔑 Password: ${password}`);
 
-              const browser = await chromium.launch({
-                headless: false,  // Real browser on Xvfb
+              const profileDir = `/tmp/sa_chrome_profile_${Date.now()}_${attempt}`;
+              fs.mkdirSync(profileDir, { recursive: true });
+
+              const launchOpts = {
+                channel: 'chrome',
+                headless: false,
+                viewport: null, // Patchright best practice: do NOT inject custom viewport or fake Windows UA on Linux
                 args: [
                   '--no-sandbox',
                   '--disable-setuid-sandbox',
                   '--disable-dev-shm-usage',
-                  '--disable-blink-features=AutomationControlled'
+                  '--window-size=1280,800'
                 ]
-              });
+              };
+              if (strat.useWarp && warpProxy) {
+                launchOpts.proxy = { server: warpProxy };
+                console.log(`  🌐 Routing browser through Cloudflare WARP proxy (${warpProxy})...`);
+              }
 
-              let capturedToken = null;
-
+              let context = null;
               try {
-                const context = await browser.newContext({
-                  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                });
+                try {
+                  context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
+                } catch {
+                  // Fallback if 'chrome' channel binary wasn't installed; use bundled patched chromium
+                  delete launchOpts.channel;
+                  context = await patchrightChromium.launchPersistentContext(profileDir, launchOpts);
+                }
 
-                // Patch fetch & XMLHttpRequest before any page scripts run so we never miss a Bearer token
-                await context.addInitScript(() => {
-                  window.__sniffedToken = null;
-                  const recordToken = (tok) => {
-                    if (tok && typeof tok === 'string' && tok.length > 40) {
-                      window.__sniffedToken = tok.replace(/^Bearer\s+/i, '').trim();
-                    }
-                  };
-                  const origFetch = window.fetch;
-                  window.fetch = async function(...args) {
-                    try {
-                      const [, opts] = args;
-                      const headers = opts?.headers;
-                      if (headers) {
-                        const auth = headers.Authorization || headers.authorization ||
-                                     (typeof headers.get === 'function' ? (headers.get('Authorization') || headers.get('authorization')) : '');
-                        if (auth && /^Bearer\s+/i.test(auth)) recordToken(auth);
-                      }
-                    } catch {}
-                    const res = await origFetch.apply(this, args);
-                    try {
-                      const clone = res.clone();
-                      clone.json().then(data => {
-                        if (data?.access_token) recordToken(data.access_token);
-                        else if (data?.token && typeof data.token === 'string' && data.token.length > 40) recordToken(data.token);
-                      }).catch(() => {});
-                    } catch {}
-                    return res;
-                  };
+                let capturedToken = null;
+                const page = context.pages()[0] || await context.newPage();
 
-                  const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-                  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-                    try {
-                      if (String(name).toLowerCase() === 'authorization' && /^Bearer\s+/i.test(value)) {
-                        recordToken(value);
-                      }
-                    } catch {}
-                    return origSetHeader.apply(this, arguments);
-                  };
-                });
-
-                const page = await context.newPage();
-
-                // ── Intercept network to capture Bearer token ──────────────────────────
-                page.on('request', req => {
+                // ── Node-side Network Interception (100% invisible to WorkOS Radar) ──
+                context.on('request', req => {
                   const auth = req.headers()['authorization'];
                   if (auth && auth.startsWith('Bearer ')) {
                     const tok = auth.replace('Bearer ', '').trim();
@@ -989,10 +993,9 @@ jobs:
                   }
                 });
 
-                page.on('response', async resp => {
+                context.on('response', async resp => {
                   try {
                     const url = resp.url();
-                    // Log non-200 responses on authkit.app so we can see any validation or Radar errors
                     if (url.includes('authkit.app') && resp.status() >= 400) {
                       const errBody = await resp.text().catch(() => '');
                       console.warn(`  ⚠️ AuthKit HTTP ${resp.status()} on ${url.split('?')[0]}: ${errBody.slice(0, 200)}`);
@@ -1020,283 +1023,184 @@ jobs:
                   } catch {}
                 });
 
-                // ── Step 1: Clear cookies & storage for a clean signup session ────────
-                console.log('  🧹 Step 1: Preparing clean browser session...');
-                await context.clearCookies();
-
-                // ── Step 2: Load Stable Audio fresh ───────────────────────────────────
-                console.log('  🌐 Step 2: Loading fresh Stable Audio page...');
+                // ── Step 1: Load Stable Audio fresh ───────────────────────────────────
+                console.log('  🌐 Step 1: Loading fresh Stable Audio page...');
                 await page.goto('https://stableaudio.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await sleep(2500 + Math.floor(Math.random() * 1000));
+
+                //Gentle human mouse movement on landing page
+                await page.mouse.move(300 + Math.random() * 200, 250 + Math.random() * 150, { steps: 10 });
+                await sleep(500);
+
+                // ── Step 2: Click Sign Up button using real hardware mouse click ─────
+                console.log('  🖱️  Step 2: Clicking Sign Up button...');
+                const signupLoc = page.locator('button:has-text("Sign up"), button:has-text("Sign Up"), a:has-text("Sign up"), a:has-text("Sign Up"), [data-testid="signup"]').first();
+                await humanClick(page, signupLoc);
+                console.log('  ✅ Sign Up clicked');
+
                 await sleep(3000);
+                await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
 
-                // ── Step 3: Click Sign Up button ─────────────────────────────────────
-                console.log('  🖱️  Step 3: Looking for Sign Up button...');
-                const signupSelectors = [
-                  'button:has-text("Sign up")',
-                  'button:has-text("Sign Up")',
-                  'a:has-text("Sign up")',
-                  'a:has-text("Sign Up")',
-                  '[data-testid="signup"]'
-                ];
-                let clicked = false;
-                for (const sel of signupSelectors) {
-                  try {
-                    await page.waitForSelector(sel, { timeout: 4000 });
-                    await page.click(sel);
-                    clicked = true;
-                    console.log(`  ✅ Sign Up clicked (${sel})`);
-                    break;
-                  } catch {}
+                // ── Step 3: Fill Email on /sign-up ───────────────────────────────────
+                console.log(`  📝 Step 3: On AuthKit page (${page.url().split('?')[0]})...`);
+                const emailLoc = page.locator('input[name="email"], input[type="email"], input[autocomplete="email"]').first();
+                await emailLoc.waitFor({ state: 'visible', timeout: 20000 });
+
+                // Dwell slightly like a real user reading the form
+                await sleep(800 + Math.floor(Math.random() * 600));
+
+                // Fill optional first/last name if visible
+                const firstLoc = page.locator('input[name="first_name"], input[name="firstName"]').first();
+                if (await firstLoc.isVisible().catch(() => false)) {
+                  await humanType(page, firstLoc, 'Alex');
                 }
-                if (!clicked) {
-                  clicked = await page.evaluate(() => {
-                    const el = Array.from(document.querySelectorAll('button, a')).find(b =>
-                      ['sign up', 'sign-up', 'get started', 'try for free'].includes(b.textContent.trim().toLowerCase())
-                    );
-                    if (el) { el.click(); return true; }
-                    return false;
-                  });
-                  if (!clicked) throw new Error('Could not find Sign Up button on Stable Audio page.');
+                const lastLoc = page.locator('input[name="last_name"], input[name="lastName"]').first();
+                if (await lastLoc.isVisible().catch(() => false)) {
+                  await humanType(page, lastLoc, 'Carter');
                 }
 
-                // Wait for AuthKit page and its client-side JS bundles to finish loading
-                await sleep(2500);
-                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+                console.log('  ✍️  Step 4: Typing email with human keystroke cadence...');
+                await humanType(page, emailLoc, email);
+                await sleep(500 + Math.floor(Math.random() * 400));
 
-                // ── Step 4–7: Interactive AuthKit State Loop ──────────────────────────
-                // Instead of clicking once and blindly waiting 60s, actively inspect and drive
-                // each AuthKit step (/sign-up -> /sign-up/password -> /email-verification -> stableaudio.com)
-                console.log(`  📝 Step 4: Driving AuthKit signup flow (starting at ${page.url().split('?')[0]})...`);
-                const flowDeadline = Date.now() + 65000;
-                let emailSubmittedCount = 0;
-                let passwordSubmittedCount = 0;
-                let otpSubmitted = false;
-                let abortAttemptReason = null;
+                const passLoc = page.locator('input[name="password"], input[type="password"]').first();
+                const passVisibleOnStep1 = await passLoc.isVisible().catch(() => false);
 
-                while (!isStableAudioHost(page.url()) && !capturedToken && Date.now() < flowDeadline) {
-                  const curUrl = page.url();
-                  let curPath = '';
-                  try { curPath = new URL(curUrl).pathname; } catch {}
+                if (!passVisibleOnStep1) {
+                  console.log('  ➡️  Submitting email step (real mouse click on Continue)...');
+                  const continueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), form button[type="submit"]').first();
+                  await humanClick(page, continueBtn);
 
-                  // Inspect visible page state (inputs, buttons, and any error alerts)
-                  const pageState = await page.evaluate(() => {
-                    const isVis = el => el && el.offsetParent !== null;
-                    const emailInputs = Array.from(document.querySelectorAll('input[name="email"], input[type="email"], input[autocomplete="email"]')).filter(isVis);
-                    const passInputs  = Array.from(document.querySelectorAll('input[name="password"], input[type="password"]')).filter(isVis);
-                    const otpInputs   = Array.from(document.querySelectorAll('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]')).filter(isVis);
-                    const firstInputs = Array.from(document.querySelectorAll('input[name="first_name"], input[name="firstName"], input[autocomplete="given-name"]')).filter(isVis);
-                    const lastInputs  = Array.from(document.querySelectorAll('input[name="last_name"], input[name="lastName"], input[autocomplete="family-name"]')).filter(isVis);
-                    const alerts      = Array.from(document.querySelectorAll('[role="alert"], .ak-Error, [class*="Error"], [class*="error"], [data-accent-color="red"]'))
-                      .filter(isVis)
-                      .map(el => el.innerText.trim())
-                      .filter(Boolean);
-                    const buttons     = Array.from(document.querySelectorAll('button')).filter(isVis).map(b => b.innerText.trim()).filter(Boolean);
-                    const bodyText    = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-                    return {
-                      hasEmail: emailInputs.length > 0,
-                      emailVal: emailInputs[0]?.value || '',
-                      hasPass:  passInputs.length > 0,
-                      passCount: passInputs.length,
-                      passValLen: passInputs[0]?.value?.length || 0,
-                      hasOtp:   otpInputs.length > 0 || /verify your email|verification code|enter the.*code/i.test(bodyText),
-                      hasFirst: firstInputs.length > 0,
-                      hasLast:  lastInputs.length > 0,
-                      alerts,
-                      buttons,
-                      bodyText
-                    };
-                  }).catch(() => null);
+                  // Wait for password field on /sign-up/password
+                  console.log('  🔑 Step 5: Waiting for /sign-up/password screen...');
+                  await passLoc.waitFor({ state: 'visible', timeout: 20000 });
+                  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+                  await sleep(1000 + Math.floor(Math.random() * 600));
+                }
 
-                  if (!pageState) {
-                    await sleep(1500);
-                    continue;
-                  }
+                // ── Step 6: Type Password & Submit with real hardware mouse click ────
+                console.log('  ✍️  Step 6: Typing password with human keystroke cadence...');
+                await humanType(page, passLoc, password);
+                await sleep(700 + Math.floor(Math.random() * 500));
 
-                  if (pageState.alerts.length > 0) {
-                    console.warn(`  ⚠️ AuthKit page alert on ${curPath}: ${pageState.alerts.join(' | ')}`);
-                    const alertStr = pageState.alerts.join(' ').toLowerCase();
-                    if (alertStr.includes('disposable') || alertStr.includes('domain') || alertStr.includes('invalid email') || alertStr.includes('not allowed')) {
-                      abortAttemptReason = `Email rejected by AuthKit: ${pageState.alerts.join(' | ')}`;
-                      break;
+                console.log('  🚀 Step 7: Clicking Continue button on password form...');
+                const passContinueBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]:has-text("Continue"), button[type="submit"]:has-text("Sign up")').first();
+                await humanClick(page, passContinueBtn);
+
+                // Wait up to 8s to see if we redirect, get an OTP screen, or get an alert
+                for (let w = 0; w < 16; w++) {
+                  await sleep(500);
+                  if (isStableAudioHost(page.url()) || capturedToken) break;
+                  if (!page.url().includes('/sign-up/password')) break;
+                }
+
+                // Check if WorkOS Radar showed an alert on /sign-up/password
+                const alertLoc = page.locator('[role="alert"], .ak-Error, [data-accent-color="red"]').first();
+                if (!isStableAudioHost(page.url()) && await alertLoc.isVisible().catch(() => false)) {
+                  const alertText = (await alertLoc.innerText().catch(() => '')).trim();
+                  if (alertText) {
+                    console.warn(`  ⚠️ AuthKit alert on attempt ${attempt}: "${alertText}"`);
+                    if (attempt < strategies.length) {
+                      console.log('  🔄 Switching to next strategy...');
+                      continue;
                     }
+                    throw new Error(`WorkOS Radar blocked signup: ${alertText}`);
                   }
+                }
 
-                  // Fill optional first/last name if visible on current screen
-                  if (pageState.hasFirst) {
-                    await fillAuthKitInput(page, 'input[name="first_name"], input[name="firstName"], input[autocomplete="given-name"]', 'Alex').catch(() => {});
-                  }
-                  if (pageState.hasLast) {
-                    await fillAuthKitInput(page, 'input[name="last_name"], input[name="lastName"], input[autocomplete="family-name"]', 'Carter').catch(() => {});
-                  }
-
-                  // CASE 1: Email verification (OTP) screen
-                  if (pageState.hasOtp && !otpSubmitted) {
-                    console.log(`  📩 Step 7b: Email verification screen detected (${curPath}) — polling temp-mail...`);
-                    if (!mailToken) {
-                      abortAttemptReason = 'AuthKit requested email OTP but current attempt has no temp-mail inbox.';
-                      break;
-                    }
+                // ── Step 7b: Handle optional email OTP verification screen ───────────
+                const otpLoc = page.locator('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]').first();
+                if (!isStableAudioHost(page.url()) && (await otpLoc.isVisible().catch(() => false) || page.url().includes('email-verification'))) {
+                  console.log('  📩 Step 7b: Email verification screen detected...');
+                  if (!mailToken) {
+                    console.warn('  ⚠️ OTP requested on non-temp-mail attempt — switching to Temp-Mail strategy...');
+                    if (attempt < strategies.length) continue;
+                  } else {
                     const otp = await pollTempMailForOtp(mailToken, 40000);
                     if (otp) {
-                      console.log(`  🔢 Received OTP code: ${otp} — entering code...`);
-                      const otpSel = 'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]';
-                      const inputs = await page.$$(otpSel);
-                      if (inputs.length >= 6) {
-                        for (let i = 0; i < 6; i++) await inputs[i].fill(otp[i]).catch(() => {});
-                      } else if (inputs.length > 0) {
-                        await fillAuthKitInput(page, otpSel, otp).catch(() => {});
-                      } else {
-                        await page.keyboard.type(otp, { delay: 60 });
+                      console.log(`  🔢 Entering OTP code: ${otp}...`);
+                      await humanType(page, otpLoc, otp);
+                      const verifyBtn = page.locator('button.ak-PrimaryButton, button[type="submit"]').first();
+                      if (await verifyBtn.isVisible().catch(() => false)) {
+                        await humanClick(page, verifyBtn);
                       }
-                      otpSubmitted = true;
-                      await sleep(800);
-                      await submitAuthKitForm(page, otpSel);
-                      await sleep(4000);
-                      continue;
-                    } else {
-                      abortAttemptReason = 'Timed out waiting for OTP email in temp-mail.';
-                      break;
+                      await sleep(3000);
                     }
                   }
-
-                  // CASE 2: Password screen (/sign-up/password or combined form)
-                  if (pageState.hasPass) {
-                    if (passwordSubmittedCount >= 4) {
-                      abortAttemptReason = `Stuck on ${curPath} after ${passwordSubmittedCount} password submit attempts (buttons: ${pageState.buttons.join(', ')} | text: "${pageState.bodyText.slice(0, 140)}")`;
-                      break;
-                    }
-                    // Wait for networkidle before filling so zxcvbn-ts validation bundle is hydrated
-                    await page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
-                    console.log(`  🔑 Step 6: Filling password on ${curPath} (attempt ${passwordSubmittedCount + 1}, visible pass inputs: ${pageState.passCount})...`);
-
-                    if (pageState.hasEmail && !pageState.emailVal) {
-                      await fillAuthKitInput(page, 'input[name="email"], input[type="email"], input[autocomplete="email"]', email);
-                    }
-
-                    await fillAuthKitInput(page, 'input[name="password"], input[type="password"]', password);
-                    await sleep(600);
-
-                    console.log(`  🚀 Step 7: Submitting password on ${curPath}...`);
-                    await submitAuthKitForm(page, 'input[name="password"], input[type="password"]');
-                    passwordSubmittedCount++;
-
-                    // Wait up to 6s for navigation or URL change
-                    const beforeUrl = page.url();
-                    for (let w = 0; w < 12; w++) {
-                      await sleep(500);
-                      if (page.url() !== beforeUrl || isStableAudioHost(page.url()) || capturedToken) break;
-                    }
-                    continue;
-                  }
-
-                  // CASE 3: Email-only screen (/sign-up step 1)
-                  if (pageState.hasEmail && !pageState.hasPass) {
-                    if (emailSubmittedCount >= 3) {
-                      abortAttemptReason = `Stuck on email step ${curPath} after ${emailSubmittedCount} attempts (text: "${pageState.bodyText.slice(0, 140)}")`;
-                      break;
-                    }
-                    console.log(`  ✍️  Step 5: Filling email on ${curPath} (attempt ${emailSubmittedCount + 1})...`);
-                    await fillAuthKitInput(page, 'input[name="email"], input[type="email"], input[autocomplete="email"]', email);
-                    await sleep(400);
-                    console.log(`  ➡️  Submitting email step...`);
-                    await submitAuthKitForm(page, 'input[name="email"], input[type="email"], input[autocomplete="email"]');
-                    emailSubmittedCount++;
-
-                    const beforeUrl = page.url();
-                    for (let w = 0; w < 10; w++) {
-                      await sleep(500);
-                      if (page.url() !== beforeUrl) break;
-                    }
-                    continue;
-                  }
-
-                  await sleep(1500);
                 }
 
-                if (abortAttemptReason) {
-                  console.warn(`  ⚠️ Attempt ${attempt} aborted: ${abortAttemptReason}`);
-                  const debugShot = `/tmp/authkit_attempt_${attempt}.png`;
-                  await page.screenshot({ path: debugShot, fullPage: true }).catch(() => {});
-                  console.warn(`  📸 Saved debug screenshot: ${debugShot}`);
-                  if (attempt < 2) {
-                    console.log('  🔄 Retrying with fallback email strategy...');
-                    continue;
+                // ── Step 8: Wait for redirect to stableaudio.com host ────────────────
+                if (!isStableAudioHost(page.url())) {
+                  console.log('  ⏳ Step 8: Waiting for redirect to stableaudio.com host...');
+                  try {
+                    await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 35000 });
+                    console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
+                  } catch {
+                    console.warn(`  ⚠️ Did not reach stableaudio.com on attempt ${attempt} (at: ${page.url()})`);
+                    if (attempt < strategies.length) continue;
                   }
-                  throw new Error(abortAttemptReason);
-                }
-
-                // ── Step 8: Verify we are on stableaudio.com & handle code/terms ───────
-                if (isStableAudioHost(page.url())) {
-                  console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
                 } else {
-                  console.warn(`  ⚠️ Not on stableaudio.com yet — current URL: ${page.url()}`);
+                  console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
                 }
 
-                // 8b: Wait for ?code= exchange in URL to finish if present
+                // Wait for OAuth ?code= cleanup if present
                 if (isStableAudioHost(page.url()) && page.url().includes('code=')) {
                   console.log('  🔄 OAuth code exchange in progress — waiting...');
-                  try {
-                    await page.waitForURL(
-                      u => isStableAudioHost(u.toString()) && !u.toString().includes('code='),
-                      { timeout: 25000 }
-                    );
-                    console.log(`  ✅ Code exchanged! URL: ${page.url()}`);
-                  } catch {
-                    console.warn('  ⚠️ Code cleanup timeout — continuing token check');
-                  }
+                  await page.waitForURL(
+                    u => isStableAudioHost(u.toString()) && !u.toString().includes('code='),
+                    { timeout: 25000 }
+                  ).catch(() => {});
                 }
                 await sleep(2500);
 
-                // 8c: Handle /terms?onboarding=1 ONLY when actually on stableaudio.com host
+                // Handle /terms?onboarding=1 when on stableaudio.com
                 if (isStableAudioHost(page.url()) && (page.url().includes('/terms') || page.url().includes('onboarding'))) {
-                  console.log('  📜 Onboarding terms page on stableaudio.com detected — accepting terms...');
-                  await page.evaluate(() => {
-                    document.querySelectorAll('input[type="checkbox"], [role="checkbox"]').forEach(cb => {
-                      if (!cb.checked && cb.getAttribute('aria-checked') !== 'true') cb.click();
-                    });
-                    const btn = Array.from(document.querySelectorAll('button')).find(b =>
-                      /accept|agree|continue|confirm|get started|start/i.test(b.textContent.trim()) && !b.disabled
-                    );
-                    if (btn) btn.click();
-                  }).catch(() => {});
+                  console.log('  📜 Accepting onboarding terms on stableaudio.com...');
+                  const checkboxes = page.locator('input[type="checkbox"], [role="checkbox"]');
+                  const cbCount = await checkboxes.count().catch(() => 0);
+                  for (let c = 0; c < cbCount; c++) {
+                    await checkboxes.nth(c).click().catch(() => {});
+                    await sleep(200);
+                  }
+                  const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("Agree"), button:has-text("Continue"), button:has-text("Get started")').first();
+                  if (await acceptBtn.isVisible().catch(() => false)) {
+                    await humanClick(page, acceptBtn).catch(() => {});
+                  }
                   await sleep(2500);
                 }
 
-                // 8d: Poll for token (60s window across network, storage, and cookies)
+                // ── Step 8c: Poll for token once on stableaudio.com ──────────────────
                 console.log('  🔍 Step 8c: Polling for token...');
-                const tokenDeadline = Date.now() + 60000;
+                const tokenDeadline = Date.now() + 50000;
                 let navigatedToGenerate = false;
 
                 while (!capturedToken && Date.now() < tokenDeadline) {
-                  // Strategy 1: Check initScript / fetch-intercepted token
-                  const sniffed = await page.evaluate(() => window.__sniffedToken || null).catch(() => null);
-                  if (sniffed) { capturedToken = sniffed; break; }
-
-                  // Strategy 2: Deep scan of localStorage & sessionStorage (including raw JWTs)
-                  const storageToken = await page.evaluate(() => {
-                    const scanStore = (store) => {
-                      for (let i = 0; i < store.length; i++) {
-                        const key = store.key(i);
-                        if (!key) continue;
-                        const raw = store.getItem(key) || '';
-                        if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(raw.trim())) {
-                          return raw.trim();
+                  // Only evaluate storage when safely on stableaudio.com
+                  if (isStableAudioHost(page.url())) {
+                    const storageToken = await page.evaluate(() => {
+                      const scanStore = (store) => {
+                        for (let i = 0; i < store.length; i++) {
+                          const key = store.key(i);
+                          if (!key) continue;
+                          const raw = store.getItem(key) || '';
+                          if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(raw.trim())) {
+                            return raw.trim();
+                          }
+                          try {
+                            const parsed = JSON.parse(raw);
+                            const tok = parsed?.body?.access_token || parsed?.access_token || parsed?.accessToken ||
+                                        parsed?.token || parsed?.idToken || parsed?.id_token || parsed?.state?.token ||
+                                        parsed?.state?.accessToken;
+                            if (tok && typeof tok === 'string' && tok.length > 40) return tok;
+                          } catch {}
                         }
-                        try {
-                          const parsed = JSON.parse(raw);
-                          const tok = parsed?.body?.access_token || parsed?.access_token || parsed?.accessToken ||
-                                      parsed?.token || parsed?.idToken || parsed?.id_token || parsed?.state?.token ||
-                                      parsed?.state?.accessToken;
-                          if (tok && typeof tok === 'string' && tok.length > 40) return tok;
-                        } catch {}
-                      }
-                      return null;
-                    };
-                    return scanStore(localStorage) || scanStore(sessionStorage);
-                  }).catch(() => null);
-                  if (storageToken) { capturedToken = storageToken; break; }
+                        return null;
+                      };
+                      return scanStore(localStorage) || scanStore(sessionStorage);
+                    }).catch(() => null);
+                    if (storageToken) { capturedToken = storageToken; break; }
+                  }
 
-                  // Strategy 3: Check cookies for JWT access/session token
                   const cookies = await context.cookies().catch(() => []);
                   for (const c of cookies) {
                     if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(c.value)) {
@@ -1307,9 +1211,7 @@ jobs:
                   }
                   if (capturedToken) break;
 
-                  // If still no token after 6s and we are on stableaudio.com, navigate to /generate
-                  // to force the SPA to make authenticated requests to api.stableaudio.com
-                  if (!navigatedToGenerate && isStableAudioHost(page.url()) && Date.now() > (tokenDeadline - 54000)) {
+                  if (!navigatedToGenerate && isStableAudioHost(page.url()) && Date.now() > (tokenDeadline - 42000)) {
                     navigatedToGenerate = true;
                     console.log('  🌐 Navigating to stableaudio.com/generate to trigger API auth header...');
                     await page.goto('https://stableaudio.com/generate', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
@@ -1325,16 +1227,15 @@ jobs:
                   return capturedToken;
                 }
 
-                const debugShot = `/tmp/authkit_timeout_${attempt}.png`;
-                await page.screenshot({ path: debugShot, fullPage: true }).catch(() => {});
-                if (attempt < 2) {
-                  console.warn(`  ⚠️ Token not captured on attempt ${attempt} (final URL: ${page.url()}). Retrying with fallback strategy...`);
+                if (attempt < strategies.length) {
+                  console.warn(`  ⚠️ Token not captured on attempt ${attempt}. Trying next strategy...`);
                   continue;
                 }
-                throw new Error(`Token not captured within timeout (final URL: ${page.url()}).`);
+                throw new Error(`Token not captured after all ${strategies.length} attempts (final URL: ${page.url()}).`);
 
               } finally {
-                await browser.close().catch(() => {});
+                if (context) await context.close().catch(() => {});
+                try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch {}
               }
             }
           }
