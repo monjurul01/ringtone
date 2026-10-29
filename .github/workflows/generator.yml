@@ -61,6 +61,7 @@ on:
           - zedge_1
           - zedge_2
           - zedge_3
+          - zedge_4
           - all_accounts
 
       gemini_session:
@@ -107,6 +108,7 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
@@ -211,7 +213,8 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -227,7 +230,7 @@ jobs:
           } else if (FIREBASE_DB_MAP[TARGET_ACCOUNT]) {
             TARGET_DB_URLS = [{ name: TARGET_ACCOUNT, url: FIREBASE_DB_MAP[TARGET_ACCOUNT] }];
           } else {
-            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, all_accounts`);
+            console.error(`❌ Unknown target_account: "${TARGET_ACCOUNT}". Use: zedge_1, zedge_2, zedge_3, zedge_4, all_accounts`);
             process.exit(1);
           }
 
@@ -738,7 +741,7 @@ jobs:
             };
           }
 
-          // ─── CREDENTIAL HELPERS ────────────────────────────────────────────────────
+          // ─── CREDENTIAL & TEMP-MAIL HELPERS (Mail.tm + Fallback) ─────────────────
           function generateRandomEmail() {
             const ts  = Date.now();
             const rnd = Math.random().toString(36).substring(2, 10);
@@ -766,25 +769,100 @@ jobs:
             return pw.split('').sort(() => Math.random() - 0.5).join('');
           }
 
-          // ─── AUTO ACCOUNT CREATION (Playwright — mirrors background.js) ───────────
-          // Called automatically when Stable Audio API returns a rate-limit error.
-          // Returns the new Bearer token string, or throws on failure.
+          // Creates a real disposable inbox via api.mail.tm so if WorkOS AuthKit asks
+          // for an email verification code (OTP), we can read it automatically.
+          async function createTempMailAccount(password) {
+            try {
+              const domRes = await fetch('https://api.mail.tm/domains');
+              if (!domRes.ok) throw new Error(`domains HTTP ${domRes.status}`);
+              const domData = await domRes.json();
+              const domains = domData['hydra:member'] || [];
+              if (!domains.length) throw new Error('No active mail.tm domains');
+              const domain = domains[0].domain;
+              const address = `sa_${Math.random().toString(36).substring(2, 9)}${Date.now().toString().slice(-5)}@${domain}`;
+
+              const accRes = await fetch('https://api.mail.tm/accounts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address, password })
+              });
+              if (!accRes.ok) throw new Error(`accounts HTTP ${accRes.status}`);
+
+              const tokRes = await fetch('https://api.mail.tm/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address, password })
+              });
+              if (!tokRes.ok) throw new Error(`token HTTP ${tokRes.status}`);
+              const tokData = await tokRes.json();
+              console.log(`  📬 Created real temp-mail inbox: ${address}`);
+              return { email: address, mailToken: tokData.token };
+            } catch (e) {
+              console.warn(`  ⚠️ Mail.tm unavailable (${e.message}) — falling back to random email.`);
+              return { email: generateRandomEmail(), mailToken: null };
+            }
+          }
+
+          async function pollTempMailForOtp(mailToken, timeoutMs = 45000) {
+            if (!mailToken) return null;
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              try {
+                const res = await fetch('https://api.mail.tm/messages', {
+                  headers: { 'Authorization': `Bearer ${mailToken}` }
+                });
+                if (res.ok) {
+                  const data = await res.json();
+                  const msgs = data['hydra:member'] || [];
+                  if (msgs.length > 0) {
+                    const msgId = msgs[0].id;
+                    const detailRes = await fetch(`https://api.mail.tm/messages/${msgId}`, {
+                      headers: { 'Authorization': `Bearer ${mailToken}` }
+                    });
+                    if (detailRes.ok) {
+                      const detail = await detailRes.json();
+                      const text = `${detail.subject || ''} ${detail.intro || ''} ${detail.text || ''}`;
+                      const codeMatch = text.match(/\b(\d{6})\b/);
+                      if (codeMatch) return codeMatch[1];
+                    }
+                  }
+                }
+              } catch {}
+              await sleep(2500);
+            }
+            return null;
+          }
+
+          function isStableAudioHost(urlStr) {
+            try {
+              const u = new URL(urlStr);
+              return (
+                (u.hostname === 'stableaudio.com' || u.hostname === 'www.stableaudio.com') &&
+                !u.hostname.includes('login.') &&
+                !u.hostname.includes('authkit.')
+              );
+            } catch {
+              return false;
+            }
+          }
+
+          // ─── AUTO ACCOUNT CREATION (Playwright — supports WorkOS AuthKit + Auth0) ──
+          // Called automatically at startup (when STABLE_AUDIO_TOKEN is empty) or when
+          // Stable Audio API returns a rate-limit error.
           async function createStableAudioAccount() {
-            const email    = generateRandomEmail();
             const password = generateStrongPassword();
+            const { email, mailToken } = await createTempMailAccount(password);
 
             console.log('\n  🤖 AUTO ACCOUNT CREATION STARTED');
             console.log(`  📧 Email   : ${email}`);
             console.log(`  🔑 Password: ${password}`);
 
-            // Use playwright-extra + stealth plugin → bypasses Auth0 bot detection
-            // Xvfb virtual display is already running (started by the workflow step above)
             const { chromium } = await import('playwright-extra');
             const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
             chromium.use(StealthPlugin());
 
             const browser = await chromium.launch({
-              headless: false,  // Real browser on Xvfb — undetectable by Auth0
+              headless: false,  // Real browser on Xvfb
               args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -799,63 +877,110 @@ jobs:
               const context = await browser.newContext({
                 userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
               });
+
+              // Patch fetch & XMLHttpRequest before any page scripts run so we never miss a Bearer token
+              await context.addInitScript(() => {
+                window.__sniffedToken = null;
+                const recordToken = (tok) => {
+                  if (tok && typeof tok === 'string' && tok.length > 40) {
+                    window.__sniffedToken = tok.replace(/^Bearer\s+/i, '').trim();
+                  }
+                };
+                const origFetch = window.fetch;
+                window.fetch = async function(...args) {
+                  try {
+                    const [, opts] = args;
+                    const headers = opts?.headers;
+                    if (headers) {
+                      const auth = headers.Authorization || headers.authorization ||
+                                   (typeof headers.get === 'function' ? (headers.get('Authorization') || headers.get('authorization')) : '');
+                      if (auth && /^Bearer\s+/i.test(auth)) recordToken(auth);
+                    }
+                  } catch {}
+                  const res = await origFetch.apply(this, args);
+                  try {
+                    const clone = res.clone();
+                    clone.json().then(data => {
+                      if (data?.access_token) recordToken(data.access_token);
+                      else if (data?.token && typeof data.token === 'string' && data.token.length > 40) recordToken(data.token);
+                    }).catch(() => {});
+                  } catch {}
+                  return res;
+                };
+
+                const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+                XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                  try {
+                    if (String(name).toLowerCase() === 'authorization' && /^Bearer\s+/i.test(value)) {
+                      recordToken(value);
+                    }
+                  } catch {}
+                  return origSetHeader.apply(this, arguments);
+                };
+              });
+
               const page = await context.newPage();
 
               // ── Intercept network to capture Bearer token ──────────────────────────
-              // Stable Audio's SPA sends the access token in Authorization headers.
-              // We sniff it from outgoing requests to their API.
               page.on('request', req => {
                 const auth = req.headers()['authorization'];
-                if (auth && auth.startsWith('Bearer ') && req.url().includes('stableaudio.com')) {
+                if (auth && auth.startsWith('Bearer ')) {
                   const tok = auth.replace('Bearer ', '').trim();
-                  if (tok.length > 50) {
+                  if (tok.length > 40 && !capturedToken) {
                     capturedToken = tok;
-                    console.log('  🔑 Token captured from network request!');
+                    console.log(`  🔑 Token captured from outgoing request (${req.url().slice(0, 60)})!`);
                   }
                 }
               });
-              // Also sniff /oauth/token response (PKCE code exchange) — this is the key one!
+
               page.on('response', async resp => {
                 try {
                   const url = resp.url();
-                  const isTokenEndpoint = url.includes('/oauth/token') || url.includes('/token') || url.includes('auth0') || url.includes('login.stableaudio');
+                  const isTokenEndpoint =
+                    url.includes('/oauth/token') ||
+                    url.includes('/token') ||
+                    url.includes('/authenticate') ||
+                    url.includes('authkit.app') ||
+                    url.includes('workos') ||
+                    url.includes('auth0') ||
+                    url.includes('login.stableaudio') ||
+                    url.includes('api.stableaudio.com');
                   if (isTokenEndpoint && resp.status() === 200) {
-                    const json = await resp.json().catch(() => null);
-                    if (json && (json.access_token || json.id_token)) {
-                      capturedToken = json.access_token || json.id_token;
-                      console.log(`  🔑 Token captured from /oauth/token response!`);
+                    const ct = resp.headers()['content-type'] || '';
+                    if (ct.includes('json')) {
+                      const json = await resp.json().catch(() => null);
+                      const tok = json?.access_token || json?.accessToken || json?.token || json?.id_token || json?.data?.access_token;
+                      if (tok && typeof tok === 'string' && tok.length > 40 && !capturedToken) {
+                        capturedToken = tok;
+                        console.log(`  🔑 Token captured from auth response (${url.slice(0, 60)})!`);
+                      }
                     }
                   }
                 } catch {}
               });
 
-              // ── Step 1: Hit Auth0 logout to destroy SSO session server-side ──────
-              console.log('  🔓 Step 1: Destroying existing Auth0 SSO session...');
-              await page.goto('https://login.stableaudio.com/v2/logout', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-              await sleep(2000);
-
-              // ── Step 2: Clear all cookies + localStorage ──────────────────────────
-              console.log('  🧹 Step 2: Wiping all cookies and storage...');
+              // ── Step 1: Clear cookies & storage for a clean signup session ────────
+              console.log('  🧹 Step 1: Preparing clean browser session...');
               await context.clearCookies();
-              await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
 
-              // ── Step 3: Load Stable Audio fresh ───────────────────────────────────
-              console.log('  🌐 Step 3: Loading fresh Stable Audio page...');
-              await page.goto('https://stableaudio.com', { waitUntil: 'networkidle', timeout: 30000 });
-              await sleep(2000);
+              // ── Step 2: Load Stable Audio fresh ───────────────────────────────────
+              console.log('  🌐 Step 2: Loading fresh Stable Audio page...');
+              await page.goto('https://stableaudio.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await sleep(3000);
 
-              // ── Step 4: Click Sign Up button ─────────────────────────────────────
-              console.log('  🖱️  Step 4: Looking for Sign Up button...');
+              // ── Step 3: Click Sign Up button ─────────────────────────────────────
+              console.log('  🖱️  Step 3: Looking for Sign Up button...');
               const signupSelectors = [
                 'button:has-text("Sign up")',
                 'button:has-text("Sign Up")',
                 'a:has-text("Sign up")',
+                'a:has-text("Sign Up")',
                 '[data-testid="signup"]'
               ];
               let clicked = false;
               for (const sel of signupSelectors) {
                 try {
-                  await page.waitForSelector(sel, { timeout: 5000 });
+                  await page.waitForSelector(sel, { timeout: 4000 });
                   await page.click(sel);
                   clicked = true;
                   console.log(`  ✅ Sign Up clicked (${sel})`);
@@ -863,121 +988,194 @@ jobs:
                 } catch {}
               }
               if (!clicked) {
-                // Try evaluating in-page
                 clicked = await page.evaluate(() => {
-                  const btn = Array.from(document.querySelectorAll('button')).find(b =>
-                    ['sign up', 'sign-up'].includes(b.textContent.trim().toLowerCase())
+                  const el = Array.from(document.querySelectorAll('button, a')).find(b =>
+                    ['sign up', 'sign-up', 'get started', 'try for free'].includes(b.textContent.trim().toLowerCase())
                   );
-                  if (btn) { btn.click(); return true; }
+                  if (el) { el.click(); return true; }
                   return false;
                 });
                 if (!clicked) throw new Error('Could not find Sign Up button on Stable Audio page.');
               }
               await sleep(3000);
 
-              // ── Step 5: Wait for Auth0 email input ───────────────────────────────
-              console.log('  📝 Step 5: Waiting for Auth0 registration form...');
-              await page.waitForSelector('input[name="email"]', { timeout: 20000 });
+              // ── Step 4: Wait for registration form (WorkOS AuthKit or Auth0) ──────
+              console.log(`  📝 Step 4: Waiting for registration form (current URL: ${page.url().slice(0, 80)})...`);
+              const emailSel = 'input[name="email"], input[type="email"], input[autocomplete="email"]';
+              await page.waitForSelector(emailSel, { timeout: 25000 });
 
-              // ── Step 6: Fill email + password using React-compatible dispatch ────
-              console.log('  ✍️  Step 6: Filling credentials...');
-              await page.evaluate(({ em, pw }) => {
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                const emailEl = document.querySelector('input[name="email"]');
-                const passEl  = document.querySelector('input[name="password"]');
-                if (emailEl) {
-                  setter.call(emailEl, em);
-                  emailEl.dispatchEvent(new Event('input',  { bubbles: true }));
-                  emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+              // Fill optional first_name / last_name if WorkOS AuthKit displays them
+              for (const [sel, val] of [
+                ['input[name="first_name"], input[name="firstName"], input[autocomplete="given-name"]', 'Alex'],
+                ['input[name="last_name"], input[name="lastName"], input[autocomplete="family-name"]', 'Carter']
+              ]) {
+                if (await page.isVisible(sel).catch(() => false)) {
+                  await page.fill(sel, val).catch(() => {});
                 }
-                if (passEl) {
-                  setter.call(passEl, pw);
-                  passEl.dispatchEvent(new Event('input',  { bubbles: true }));
-                  passEl.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-              }, { em: email, pw: password });
-              await sleep(800);
-
-              // ── Step 7: Submit the form ───────────────────────────────────────────
-              console.log('  🚀 Step 7: Submitting registration form...');
-              await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
-              await page.click('button[type="submit"]');
-
-              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
-              // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
-              // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
-              // We MUST NOT navigate away during this exchange — stay on callback URL!
-              console.log('  ⏳ Step 8: Waiting for OAuth code exchange + token...');
-
-              // 8a: Wait until we land on stableaudio.com
-              if (!page.url().includes('stableaudio.com')) {
-                try {
-                  await page.waitForURL(url => url.includes('stableaudio.com'), { timeout: 60000 });
-                  console.log(`  ✅ OAuth callback arrived: ${page.url()}`);
-                } catch {
-                  console.warn(`  ⚠️ Timeout waiting for redirect — on: ${page.url()}`);
-                }
-              } else {
-                console.log(`  ✅ Already on stableaudio.com: ${page.url()}`);
               }
 
-              // 8b: If URL has ?code= the SPA is exchanging it — wait for clean URL
+              // ── Step 5: Fill email & handle single-step vs two-step password ──────
+              console.log('  ✍️  Step 5: Filling email...');
+              await page.fill(emailSel, email);
+              await sleep(500);
+
+              const passSel = 'input[name="password"], input[type="password"]';
+              const passVisibleOnStep1 = await page.isVisible(passSel).catch(() => false);
+
+              if (passVisibleOnStep1) {
+                console.log('  ✍️  Password field visible on Step 1 — filling password...');
+                await page.fill(passSel, password);
+                await sleep(500);
+                console.log('  🚀 Step 6: Submitting registration form...');
+                await page.click('button[type="submit"]');
+              } else {
+                // WorkOS AuthKit 2-step flow: Step 1 submits email, Step 2 asks for password
+                console.log('  ➡️  Submitting email step (WorkOS AuthKit 2-step flow)...');
+                await page.click('button[type="submit"]');
+                await sleep(2000);
+
+                console.log('  🔑 Step 6: Waiting for AuthKit password field...');
+                await page.waitForSelector(passSel, { state: 'visible', timeout: 20000 });
+                await page.fill(passSel, password);
+                await sleep(600);
+
+                console.log('  🚀 Step 7: Submitting password...');
+                await page.click('button[type="submit"]');
+              }
+
+              await sleep(3000);
+
+              // ── Step 7b: Handle optional email verification code (OTP) step ───────
+              const otpSel = 'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]';
+              const needsOtp = await page.isVisible(otpSel).catch(() => false) ||
+                await page.evaluate(() => /verify your email|verification code|enter the.*code/i.test(document.body?.innerText || '')).catch(() => false);
+
+              if (needsOtp) {
+                console.log('  📩 Email verification code requested by AuthKit — polling temp-mail inbox...');
+                const otp = await pollTempMailForOtp(mailToken, 45000);
+                if (otp) {
+                  console.log(`  🔢 Received OTP code: ${otp} — entering code...`);
+                  const inputs = await page.$$(otpSel);
+                  if (inputs.length >= 6) {
+                    for (let i = 0; i < 6; i++) {
+                      await inputs[i].fill(otp[i]).catch(() => {});
+                    }
+                  } else if (inputs.length > 0) {
+                    await inputs[0].fill(otp).catch(() => {});
+                  } else {
+                    await page.keyboard.type(otp, { delay: 80 });
+                  }
+                  await sleep(800);
+                  const submitBtn = await page.$('button[type="submit"]');
+                  if (submitBtn) await submitBtn.click().catch(() => {});
+                  await sleep(3000);
+                } else {
+                  console.warn('  ⚠️ Could not retrieve OTP code from temp-mail within 45s.');
+                }
+              }
+
+              // ── Step 8: Wait until redirected back to actual stableaudio.com host ─
+              // IMPORTANT: Check parsed hostname (NOT url.includes('stableaudio.com'),
+              // which matched the redirect_uri query param while still on authkit.app!)
+              console.log('  ⏳ Step 8: Waiting for redirect to stableaudio.com host...');
+              if (!isStableAudioHost(page.url())) {
+                try {
+                  await page.waitForURL(u => isStableAudioHost(u.toString()), { timeout: 60000 });
+                  console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
+                } catch {
+                  console.warn(`  ⚠️ Timeout waiting for stableaudio.com redirect — currently on: ${page.url()}`);
+                }
+              } else {
+                console.log(`  ✅ Already on stableaudio.com host: ${page.url()}`);
+              }
+
+              // 8b: Wait for ?code= exchange in URL to finish if present
               if (page.url().includes('code=')) {
-                console.log('  🔄 OAuth code exchange in progress — waiting (do NOT navigate)...');
+                console.log('  🔄 OAuth code exchange in progress — waiting...');
                 try {
                   await page.waitForURL(
-                    url => url.includes('stableaudio.com') && !url.includes('code='),
+                    u => isStableAudioHost(u.toString()) && !u.toString().includes('code='),
                     { timeout: 30000 }
                   );
                   console.log(`  ✅ Code exchanged! URL: ${page.url()}`);
                 } catch {
-                  console.warn('  ⚠️ Code cleanup timeout — token may already be in localStorage');
+                  console.warn('  ⚠️ Code cleanup timeout — continuing token check');
                 }
               }
               await sleep(3000);
 
-              // 8c: Poll for token (90s window, 3 strategies)
+              // 8c: Handle /terms?onboarding=1 if Stable Audio redirected to onboarding terms
+              if (page.url().includes('/terms') || page.url().includes('onboarding')) {
+                console.log('  📜 Onboarding terms page detected — accepting terms if present...');
+                await page.evaluate(() => {
+                  document.querySelectorAll('input[type="checkbox"], [role="checkbox"]').forEach(cb => {
+                    if (!cb.checked && cb.getAttribute('aria-checked') !== 'true') cb.click();
+                  });
+                  const btn = Array.from(document.querySelectorAll('button')).find(b =>
+                    /accept|agree|continue|confirm|get started|start/i.test(b.textContent.trim()) && !b.disabled
+                  );
+                  if (btn) btn.click();
+                }).catch(() => {});
+                await sleep(2500);
+              }
+
+              // 8d: Poll for token (90s window across network, storage, and cookies)
               console.log('  🔍 Step 8c: Polling for token...');
               const tokenDeadline = Date.now() + 90000;
-              while (!capturedToken && Date.now() < tokenDeadline) {
-                // Strategy 1: Deep localStorage scan
-                const lsToken = await page.evaluate(() => {
-                  for (let i = 0; i < localStorage.length; i++) {
-                    const key = localStorage.key(i);
-                    if (!key) continue;
-                    try {
-                      const parsed = JSON.parse(localStorage.getItem(key));
-                      if (parsed?.body?.access_token) return parsed.body.access_token;
-                      if (parsed?.access_token)       return parsed.access_token;
-                      if (parsed?.idToken)             return parsed.idToken;
-                    } catch {}
-                  }
-                  return null;
-                }).catch(() => null);
-                if (lsToken) { capturedToken = lsToken; break; }
+              let navigatedToGenerate = false;
 
-                // Strategy 2: Fetch interceptor (sniff outgoing Authorization headers)
-                const intercepted = await page.evaluate(() => {
-                  if (window.__sniffedToken) return window.__sniffedToken;
-                  if (!window.__fetchPatched) {
-                    window.__fetchPatched = true;
-                    const origFetch = window.fetch;
-                    window.fetch = function(...args) {
-                      const [, opts] = args;
-                      const auth = opts?.headers?.Authorization || opts?.headers?.authorization || '';
-                      if (auth.startsWith('Bearer ') && auth.length > 60)
-                        window.__sniffedToken = auth.replace('Bearer ', '');
-                      return origFetch.apply(this, args);
-                    };
-                  }
-                  return null;
+              while (!capturedToken && Date.now() < tokenDeadline) {
+                // Strategy 1: Check initScript / fetch-intercepted token
+                const sniffed = await page.evaluate(() => window.__sniffedToken || null).catch(() => null);
+                if (sniffed) { capturedToken = sniffed; break; }
+
+                // Strategy 2: Deep scan of localStorage & sessionStorage (including raw JWTs)
+                const storageToken = await page.evaluate(() => {
+                  const scanStore = (store) => {
+                    for (let i = 0; i < store.length; i++) {
+                      const key = store.key(i);
+                      if (!key) continue;
+                      const raw = store.getItem(key) || '';
+                      if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(raw.trim())) {
+                        return raw.trim();
+                      }
+                      try {
+                        const parsed = JSON.parse(raw);
+                        const tok = parsed?.body?.access_token || parsed?.access_token || parsed?.accessToken ||
+                                    parsed?.token || parsed?.idToken || parsed?.id_token || parsed?.state?.token ||
+                                    parsed?.state?.accessToken;
+                        if (tok && typeof tok === 'string' && tok.length > 40) return tok;
+                      } catch {}
+                    }
+                    return null;
+                  };
+                  return scanStore(localStorage) || scanStore(sessionStorage);
                 }).catch(() => null);
-                if (intercepted) { capturedToken = intercepted; break; }
+                if (storageToken) { capturedToken = storageToken; break; }
+
+                // Strategy 3: Check cookies for JWT access/session token
+                const cookies = await context.cookies().catch(() => []);
+                for (const c of cookies) {
+                  if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(c.value)) {
+                    capturedToken = c.value;
+                    console.log(`  🔑 JWT token captured from cookie (${c.name})!`);
+                    break;
+                  }
+                }
+                if (capturedToken) break;
+
+                // If still no token after 8s and we are on stableaudio.com, navigate to /generate
+                // to force the SPA to make authenticated requests to api.stableaudio.com
+                if (!navigatedToGenerate && isStableAudioHost(page.url()) && Date.now() > (tokenDeadline - 82000)) {
+                  navigatedToGenerate = true;
+                  console.log('  🌐 Navigating to stableaudio.com/generate to trigger API auth header...');
+                  await page.goto('https://stableaudio.com/generate', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                }
 
                 await sleep(1500);
               }
 
-              if (!capturedToken) throw new Error('Token not captured within 90s after OAuth code exchange.');
+              if (!capturedToken) throw new Error(`Token not captured within 90s (final URL: ${page.url()}).`);
 
               console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
               console.log(`  📧 ${email}`);
@@ -1615,6 +1813,7 @@ jobs:
           ZEDGE1_DB_URL: ${{ secrets.ZEDGE1_DB_URL }}
           ZEDGE2_DB_URL: ${{ secrets.ZEDGE2_DB_URL }}
           ZEDGE3_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          ZEDGE4_DB_URL: ${{ secrets.ZEDGE4_DB_URL }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           IMAGE_QUEUE_PATH: ${{ github.event.inputs.image_queue_path }}
@@ -1803,7 +2002,8 @@ jobs:
           const FIREBASE_DB_MAP = Object.fromEntries(Object.entries({
             zedge_1: process.env.ZEDGE1_DB_URL,
             zedge_2: process.env.ZEDGE2_DB_URL,
-            zedge_3: process.env.ZEDGE3_DB_URL
+            zedge_3: process.env.ZEDGE3_DB_URL,
+            zedge_4: process.env.ZEDGE4_DB_URL
           }).filter(([, u]) => u && u.trim()).map(([k, u]) => [k, u.trim().replace(/\/+$/, '')]));
           if (!Object.keys(FIREBASE_DB_MAP).length) { console.error('No ZEDGEn_DB_URL GitHub secret is set - add them in GitHub > Settings > Secrets and variables > Actions'); process.exit(1); }
 
@@ -2799,6 +2999,6 @@ jobs:
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Mode | Auto-scan (all images missing metadata) |" >> $GITHUB_STEP_SUMMARY
           echo "| Queue path | ${{ github.event.inputs.image_queue_path }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target DBs | All (zedge_1, zedge_2, zedge_3, zedge_4) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Image metadata generated via Gemini Web (image upload) and patched back to Firebase." >> $GITHUB_STEP_SUMMARY
