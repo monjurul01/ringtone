@@ -1340,30 +1340,38 @@ jobs:
                   console.log(`  ✅ Landed on stableaudio.com: ${page.url()}`);
                 }
 
-                // Wait for OAuth ?code= cleanup if present
+                // Wait for OAuth ?code= cleanup if present (max 6s or until token is captured)
                 if (isStableAudioHost(page.url()) && page.url().includes('code=')) {
                   console.log('  🔄 OAuth code exchange in progress — waiting...');
-                  await page.waitForURL(
-                    u => isStableAudioHost(u.toString()) && !u.toString().includes('code='),
-                    { timeout: 25000 }
-                  ).catch(() => {});
+                  for (let w = 0; w < 12; w++) {
+                    await sleep(500);
+                    if (!page.url().includes('code=') || (capturedToken && page.url().includes('/terms'))) break;
+                  }
                 }
-                await sleep(2500);
+                await sleep(800);
 
-                // Handle /terms?onboarding=1 when on stableaudio.com
+                // Handle /terms?onboarding=1 FAST without 30s Playwright action timeouts
                 if (isStableAudioHost(page.url()) && (page.url().includes('/terms') || page.url().includes('onboarding'))) {
-                  console.log('  📜 Accepting onboarding terms on stableaudio.com...');
-                  const checkboxes = page.locator('input[type="checkbox"], [role="checkbox"]');
-                  const cbCount = await checkboxes.count().catch(() => 0);
-                  for (let c = 0; c < cbCount; c++) {
-                    await checkboxes.nth(c).click().catch(() => {});
-                    await sleep(250);
-                  }
+                  console.log('  📜 Accepting onboarding terms on stableaudio.com (fast mode)...');
+                  await page.evaluate(() => {
+                    document.querySelectorAll('input[type="checkbox"], button[role="checkbox"], [role="checkbox"]').forEach(el => {
+                      const checked = el.checked === true || el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked';
+                      if (!checked) el.click();
+                    });
+                  }).catch(() => {});
+                  await sleep(400);
+
                   const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("Agree"), button:has-text("Continue"), button:has-text("Get started"), button[type="submit"]').first();
-                  if (await acceptBtn.isVisible().catch(() => false)) {
-                    await humanClick(page, acceptBtn).catch(() => {});
-                  }
-                  await sleep(3000);
+                  await acceptBtn.click({ timeout: 2000, force: true }).catch(() => {});
+                  await sleep(800);
+                }
+
+                // Instant exit if token was already captured from WorkOS /authenticate response!
+                if (capturedToken) {
+                  console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY (Fast Exit)');
+                  console.log(`  📧 ${email}`);
+                  console.log(`  🔑 Token: ${capturedToken.slice(0, 30)}...`);
+                  return capturedToken;
                 }
 
                 // ── Step 8c: Poll for token once on stableaudio.com ──────────────────
