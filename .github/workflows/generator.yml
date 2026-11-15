@@ -350,9 +350,22 @@ jobs:
 
             // Paste prompt and submit via Enter
             await geminiPage.keyboard.insertText(promptText);
-            await sleep(500);
+            await sleep(800);
             await geminiPage.keyboard.press('Enter');
             console.log(`    ⌨️  Submitted via Enter key`);
+            await sleep(800);
+
+            // Click Send button directly if Enter did not submit
+            const sendBtn = geminiPage.locator(
+              'button[aria-label="Send message"], button[aria-label*="Send"], button.send-button'
+            ).first();
+            if (await sendBtn.isVisible().catch(() => false)) {
+              const isDisabled = await sendBtn.getAttribute('aria-disabled');
+              if (isDisabled !== 'true') {
+                await sendBtn.click({ force: true }).catch(() => {});
+                console.log('    🖱️  Clicked Send button');
+              }
+            }
 
             // Poll: wait for the new response element to appear, then stabilize
             const deadline = Date.now() + 90000;
@@ -1110,11 +1123,27 @@ jobs:
                 await page.mouse.move(300 + Math.random() * 200, 250 + Math.random() * 150, { steps: 10 });
                 await sleep(500);
 
-                // ── Step 2: Click Sign Up button using real hardware mouse click ─────
+                // ── Step 2: Click Sign Up button (target VISIBLE button, fallback to DOM click) ─────
                 console.log('  🖱️  Step 2: Clicking Sign Up button...');
-                const signupLoc = page.locator('button:has-text("Sign up"), button:has-text("Sign Up"), a:has-text("Sign up"), a:has-text("Sign Up"), [data-testid="signup"]').first();
-                await humanClick(page, signupLoc);
-                console.log('  ✅ Sign Up clicked');
+                const visibleSignupLoc = page.locator(
+                  'button:has-text("Sign up"):visible, button:has-text("Sign Up"):visible, a:has-text("Sign up"):visible, a:has-text("Sign Up"):visible, [data-testid="signup"]:visible'
+                ).first();
+
+                const isVis = await visibleSignupLoc.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
+                if (isVis) {
+                  await humanClick(page, visibleSignupLoc);
+                  console.log('  ✅ Sign Up clicked (visible button)');
+                } else {
+                  console.log('  ⚠️ Visible Sign Up button not directly matched — triggering DOM click...');
+                  await page.evaluate(() => {
+                    const els = [...document.querySelectorAll('button, a')].filter(el =>
+                      /^\s*sign\s*up\s*$/i.test(el.innerText || el.textContent || '')
+                    );
+                    const vis = els.find(el => el.offsetParent !== null) || els[0];
+                    if (vis) vis.click();
+                  });
+                  console.log('  ✅ Sign Up triggered via DOM click');
+                }
 
                 await sleep(3000);
                 await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
@@ -2633,9 +2662,22 @@ jobs:
             const initialCount = await getResponseCount();
 
             await geminiPage.keyboard.insertText(promptText);
-            await sleep(500);
+            await sleep(800);
             await geminiPage.keyboard.press('Enter');
             console.log(`    ⌨️  Submitted via Enter key`);
+            await sleep(800);
+
+            // Click Send button directly if Enter did not submit
+            const sendBtn = geminiPage.locator(
+              'button[aria-label="Send message"], button[aria-label*="Send"], button.send-button'
+            ).first();
+            if (await sendBtn.isVisible().catch(() => false)) {
+              const isDisabled = await sendBtn.getAttribute('aria-disabled');
+              if (isDisabled !== 'true') {
+                await sendBtn.click({ force: true }).catch(() => {});
+                console.log('    🖱️  Clicked Send button');
+              }
+            }
 
             const deadline = Date.now() + 90000;
             // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
@@ -2705,216 +2747,55 @@ jobs:
           }
 
           // ─── GEMINI: UPLOAD IMAGE FILE ─────────────────────────────────────────────
-          // PRIMARY: Playwright's native setInputFiles() via the "Open upload file menu"
-          // button — the same mechanism the Rigatone extension uses.
-          // FALLBACK: evaluate()-based strategies (clipboard, drag, file-input-override).
           async function uploadImageToGemini(imagePath, geminiPage) {
             console.log(`    📎 Uploading image: ${path.basename(imagePath)}`);
 
-            const mimeType = imagePath.endsWith('.jpg') || imagePath.endsWith('.jpeg')
-              ? 'image/jpeg'
-              : imagePath.endsWith('.webp') ? 'image/webp' : 'image/png';
-
-            // Log DOM state for debugging
-            const domDebug = await geminiPage.evaluate(() => ({
-              fileInputs : document.querySelectorAll('input[type="file"]').length,
-              editors    : document.querySelectorAll('div.ql-editor, rich-textarea').length,
-              ariaButtons: [...document.querySelectorAll('button[aria-label]')]
-                             .map(b => b.getAttribute('aria-label')).filter(Boolean).slice(0, 15),
-            })).catch(() => ({}));
-            console.log(`    🔍 DOM: fileInputs=${domDebug.fileInputs}, editors=${domDebug.editors}`);
-            console.log(`    🔍 aria-labels: ${JSON.stringify(domDebug.ariaButtons)}`);
-
-            // ── STRATEGY A: Native setInputFiles via upload button (most reliable) ────
-            // Clicks "Open upload file menu" → waits for file input → setInputFiles()
-            // This mirrors exactly what the Rigatone extension does in the browser.
+            // Strategy 1: Click upload button & handle menu / filechooser cleanly
             try {
-              // Try aria-label variants Gemini uses for the upload/attachment button
-              const uploadBtnSelectors = [
-                'button[aria-label="Open upload file menu"]',
-                'button[aria-label="Upload file"]',
-                'button[aria-label="Add image"]',
-                'button[aria-label="Attach files"]',
-                '[aria-label="Open upload file menu"]',
-                '[data-test-id="upload-button"]',
-              ];
+              const uploadBtn = geminiPage.locator(
+                'button[aria-label*="Upload"], button[aria-label*="upload"], button[aria-label*="Add"], button[aria-label*="Attach"]'
+              ).first();
 
-              let uploadBtnClicked = false;
-              for (const sel of uploadBtnSelectors) {
-                try {
-                  const btn = await geminiPage.$(sel);
-                  if (btn) {
-                    await btn.click();
-                    console.log(`    🖱️  Clicked upload button: ${sel}`);
-                    uploadBtnClicked = true;
-                    break;
-                  }
-                } catch (_) {}
-              }
+              if (await uploadBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+                const fileChooserPromise = geminiPage.waitForEvent('filechooser', { timeout: 4000 }).catch(() => null);
+                await uploadBtn.click({ force: true });
+                await sleep(600);
 
-              if (!uploadBtnClicked) {
-                // Fallback: find by aria-label text match in page evaluate
-                uploadBtnClicked = await geminiPage.evaluate(() => {
-                  const btn = [...document.querySelectorAll('button, [role="button"]')].find(el => {
-                    const label = (el.getAttribute('aria-label') || '').toLowerCase();
-                    return label.includes('upload') || label.includes('attach') || label.includes('add image');
-                  });
-                  if (btn) { btn.click(); return true; }
-                  return false;
-                });
-                if (uploadBtnClicked) console.log('    🖱️  Clicked upload button via evaluate fallback');
-              }
+                // If menu opens, click "Upload files" option
+                const menuUploadItem = geminiPage.locator(
+                  '[role="menuitem"]:has-text("Upload"), button:has-text("Upload files"), div:has-text("Upload files")'
+                ).last();
+                if (await menuUploadItem.isVisible({ timeout: 1500 }).catch(() => false)) {
+                  await menuUploadItem.click({ force: true });
+                }
 
-              if (uploadBtnClicked) {
-                // Wait for a file input to appear (hidden inputs become temporarily accessible)
-                const fileInput = await geminiPage.waitForSelector('input[type="file"]', { timeout: 5000 }).catch(() => null);
-                if (fileInput) {
-                  // Use Playwright's native setInputFiles — bypasses all JS injection complexity
-                  await fileInput.setInputFiles(imagePath);
-                  console.log('    ✅ Image attached via strategy: setInputFiles (native Playwright)');
-                  await sleep(1500);
+                const fileChooser = await fileChooserPromise;
+                if (fileChooser) {
+                  await fileChooser.setFiles(imagePath);
+                  console.log('    ✅ Image attached via native fileChooser');
+                  await sleep(3500);
                   return true;
                 }
               }
             } catch (e) {
-              console.log(`    ⚠️  setInputFiles strategy failed: ${e.message}`);
+              console.log(`    ⚠️ fileChooser attempt notice: ${e.message}`);
             }
 
-            // ── STRATEGY B: Playwright filechooser intercept ──────────────────────────
-            // Triggers the file chooser dialog by clicking any upload button.
+            // Strategy 2: Direct hidden input[type="file"]
             try {
-              const [fileChooser] = await Promise.all([
-                geminiPage.waitForEvent('filechooser', { timeout: 4000 }),
-                geminiPage.evaluate(() => {
-                  const btn = [...document.querySelectorAll('button, [role="button"]')].find(el => {
-                    const label = (el.getAttribute('aria-label') || el.textContent || '').toLowerCase();
-                    return label.includes('upload') || label.includes('attach') || label.includes('add image');
-                  });
-                  if (btn) btn.click();
-                }),
-              ]);
-              await fileChooser.setFiles(imagePath);
-              console.log('    ✅ Image attached via strategy: filechooser-intercept');
-              await sleep(1500);
-              return true;
-            } catch (_) {}
-
-            // ── STRATEGY C: evaluate()-based injection (clipboard / drag / file-input) ─
-            const imageBuffer = fs.readFileSync(imagePath);
-            const base64Data  = imageBuffer.toString('base64');
-            const dataUrl = `data:${mimeType};base64,${base64Data}`;
-
-            const result = await geminiPage.evaluate(async ({ dataUrl, name, mime }) => {
-
-              function dataUrlToFile(dataUrl, name, type) {
-                const arr  = dataUrl.split(',');
-                const bstr = atob(arr[1]);
-                let n = bstr.length;
-                const u8 = new Uint8Array(n);
-                while (n--) u8[n] = bstr.charCodeAt(n);
-                return new File([u8], name, { type });
+              const fileInput = geminiPage.locator('input[type="file"]').first();
+              if ((await fileInput.count()) > 0) {
+                await fileInput.setInputFiles(imagePath);
+                console.log('    ✅ Image attached via direct input[type="file"]');
+                await sleep(3500);
+                return true;
               }
-
-              function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-              function hasAttachment() {
-                return [
-                  'ms-file-attachment', 'upload-progress-thumbnail',
-                  '[class*="upload-thumbnail"]', '[class*="file-chip"]',
-                  '[class*="attachment"]', '[class*="FileChip"]',
-                  '[jsname][class*="chip"]', 'rich-textarea img',
-                  '[data-test-id*="attachment"]', '[data-test-id*="upload"]',
-                  '.attachment-chip', '.upload-thumbnail',
-                ].some(s => document.querySelector(s));
-              }
-
-              const files = [dataUrlToFile(dataUrl, name, mime)];
-
-              // C1: ClipboardEvent paste
-              try {
-                const editor =
-                  document.querySelector('rich-textarea [contenteditable="true"]') ||
-                  document.querySelector('.ql-editor') ||
-                  document.querySelector('[contenteditable="true"]');
-                if (editor) {
-                  editor.focus();
-                  for (const file of files) {
-                    const dt = new DataTransfer();
-                    dt.items.add(file);
-                    editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
-                    await delay(150);
-                  }
-                  await delay(700);
-                  if (hasAttachment()) return { ok: true, strategy: 'clipboard-paste' };
-                }
-              } catch (_) {}
-
-              // C2: Broad DragEvent broadcast
-              try {
-                const dt = new DataTransfer();
-                files.forEach(f => dt.items.add(f));
-                const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
-                window.dispatchEvent(new DragEvent('dragenter', opts));
-                document.dispatchEvent(new DragEvent('dragenter', opts));
-                await delay(150);
-                window.dispatchEvent(new DragEvent('dragover', opts));
-                document.dispatchEvent(new DragEvent('dragover', opts));
-                await delay(250);
-                const targets = [
-                  document.querySelector('[data-filedrop-id="chat-window-input-container"]'),
-                  document.querySelector('file-drop-indicator'),
-                  document.querySelector('.input-area-container'),
-                  document.querySelector('.input-area'),
-                  document.querySelector('rich-textarea'),
-                  document.querySelector('[contenteditable="true"]'),
-                  document.querySelector('fieldset'),
-                  document.body,
-                ].filter(Boolean);
-                for (const el of targets) { el.dispatchEvent(new DragEvent('drop', opts)); await delay(80); }
-                document.dispatchEvent(new DragEvent('drop', opts));
-                window.dispatchEvent(new DragEvent('drop', opts));
-                await delay(800);
-                if (hasAttachment()) return { ok: true, strategy: 'drag-broadcast' };
-              } catch (_) {}
-
-              // C3: file-input override on existing hidden inputs
-              try {
-                const inputs = [...document.querySelectorAll('input[type="file"]')];
-                let tried = 0;
-                for (const inp of inputs) {
-                  try {
-                    const dt2 = new DataTransfer();
-                    files.forEach(f => dt2.items.add(f));
-                    Object.defineProperty(inp, 'files', { value: dt2.files, configurable: true });
-                    inp.dispatchEvent(new Event('change', { bubbles: true }));
-                    inp.dispatchEvent(new Event('input',  { bubbles: true }));
-                    tried++;
-                  } catch (_) {}
-                }
-                if (tried) {
-                  await delay(700);
-                  if (hasAttachment()) return { ok: true, strategy: 'file-input-override' };
-                }
-              } catch (_) {}
-
-              return { ok: false, strategy: 'all-failed' };
-
-            }, { dataUrl, name: path.basename(imagePath), mime: mimeType });
-
-            if (result.ok) {
-              console.log(`    ✅ Image attached via strategy: ${result.strategy}`);
-              return true;
-            }
-
-            // All strategies failed — take a debug screenshot
-            console.warn('    ❌ All strategies exhausted. Taking debug screenshot...');
-            try {
-              const screenshotPath = `/tmp/gemini_upload_fail_${Date.now()}.png`;
-              await geminiPage.screenshot({ path: screenshotPath, fullPage: false });
-              console.warn(`    📸 Screenshot saved: ${screenshotPath}`);
             } catch (e) {
-              console.warn(`    📸 Screenshot failed: ${e.message}`);
+              console.log(`    ⚠️ Direct file input failed: ${e.message}`);
             }
+
+            // Fallback: Close any lingering upload menu before returning false
+            try { await geminiPage.keyboard.press('Escape'); await sleep(300); } catch (_) {}
             return false;
           }
 
