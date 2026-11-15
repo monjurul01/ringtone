@@ -2769,7 +2769,13 @@ jobs:
               await sleep(3000);
               sent = await isSubmitted();
               console.log(`    📨 Submit check ${attempt}: ${sent ? 'SENT' : 'NOT sent'}`);
-              if (!sent) await diag(`notsent_${attempt}`);
+              if (!sent) {
+                await diag(`notsent_${attempt}`);
+                const geminiErr = await geminiPage.evaluate(() => /something went wrong/i.test(document.body.innerText || '')).catch(() => false);
+                if (geminiErr) {
+                  throw new Error('GEMINI_SERVER_ERROR: Gemini replied "Something went wrong" to Send (image/prompt rejected or temporary Gemini error - not a script bug)');
+                }
+              }
             }
             if (!sent) {
               throw new Error('Gemini: prompt was never submitted (see 🔎 diagnostics + gemini_notsent_*.png in debug-screenshots artifact)');
@@ -3136,12 +3142,24 @@ jobs:
               try {
                 tmpImagePath = await imageToTempFile(record, key, kind);
                 let metadata = null;
+                let useImg = tmpImagePath;
                 for (let t = 1; t <= 3 && !metadata; t++) {
-                  try { metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind); }
+                  if (t >= 2) {
+                    // Gemini may reject large / odd images: retry with a 1024px JPEG copy
+                    try {
+                      const small = tmpImagePath.replace(/\.[^.]+$/, '') + '_small.jpg';
+                      execSync(`ffmpeg -y -i "${tmpImagePath}" -vf "scale='min(1024,iw)':-2" -q:v 4 "${small}"`, { stdio: 'pipe' });
+                      if (fs.existsSync(small) && fs.statSync(small).size > 1024) {
+                        useImg = small;
+                        console.log(`  🗜️  Retry ${t}: using downscaled image (${(fs.statSync(small).size / 1024).toFixed(0)} KB)`);
+                      }
+                    } catch (e2) { console.warn(`  ⚠️ downscale failed: ${String(e2.message).split('\n')[0]}`); }
+                  }
+                  try { metadata = await generateImageMetadata(useImg, key, geminiPage, kind); }
                   catch (e) {
                     console.warn(`  ⚠️ [${db.name}] [${key}] Gemini attempt ${t}/3 failed: ${e.message}`);
                     if (t === 3) throw e;
-                    await sleep(5000);
+                    await sleep(20000);
                   }
                 }
                 let check = zedgeEnforce(metadata, 'image');
