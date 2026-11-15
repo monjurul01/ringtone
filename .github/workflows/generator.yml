@@ -2670,30 +2670,64 @@ jobs:
             });
             await sleep(1000);
 
-            // Wait up to 10s for Send button to become enabled (image upload might still be processing)
+            // v6: wait for the image upload to finish, click Send, then VERIFY the message was really submitted
+            // (old code logged "Clicked Send button" even when the button was still disabled -> nothing was sent -> 90s timeout).
             const sendBtn = geminiPage.locator(
               'button[aria-label="Send message"], button[aria-label*="Send"], button.send-button'
             ).first();
+            const editorSel = 'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"]';
 
-            for (let w = 0; w < 20; w++) {
-              const vis = await sendBtn.isVisible().catch(() => false);
-              const dis = await sendBtn.getAttribute('aria-disabled').catch(() => 'true');
-              const nativeDis = await sendBtn.isDisabled().catch(() => true);
-              if (vis && dis !== 'true' && !nativeDis) break;
-              await sleep(500);
+            let sent = false;
+            for (let attempt = 1; attempt <= 3 && !sent; attempt++) {
+              // wait up to 30s for Send to become enabled (image may still be uploading)
+              for (let w = 0; w < 60; w++) {
+                const vis = await sendBtn.isVisible().catch(() => false);
+                const dis = await sendBtn.getAttribute('aria-disabled').catch(() => 'true');
+                const nativeDis = await sendBtn.isDisabled().catch(() => true);
+                if (vis && dis !== 'true' && !nativeDis) break;
+                await sleep(500);
+              }
+              if (await sendBtn.isVisible().catch(() => false)) {
+                await sendBtn.click({ force: true }).catch(() => {});
+                console.log(`    🖱️  Clicked Send button (attempt ${attempt})`);
+              } else {
+                await geminiPage.keyboard.press('Enter');
+                console.log(`    ⌨️  Submitted via Enter key (attempt ${attempt})`);
+              }
+              await sleep(2500);
+
+              // submitted = Stop button visible, OR editor emptied, OR a new response block appeared
+              sent = await geminiPage.evaluate((sel) => {
+                const stop = document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"]');
+                const ed = document.querySelector(sel);
+                const edLen = ((ed && (ed.innerText || ed.textContent)) || '').trim().length;
+                return !!stop || edLen < 20;
+              }, editorSel).catch(() => false);
+              if (!sent && (await getResponseCount()) > initialCount) sent = true;
+              console.log(`    📨 Submit check ${attempt}/3: ${sent ? 'SENT' : 'NOT sent'}`);
+
+              if (!sent && attempt < 3) {
+                // make sure the prompt text is still in the editor, then retry
+                const stillThere = await geminiPage.evaluate((sel) => {
+                  const ed = document.querySelector(sel);
+                  return ((ed && (ed.innerText || ed.textContent)) || '').trim().length > 20;
+                }, editorSel).catch(() => false);
+                if (!stillThere) {
+                  await editor.click({ force: true }).catch(() => {});
+                  await editor.fill(promptText).catch(async () => { await geminiPage.keyboard.insertText(promptText); });
+                  await sleep(1000);
+                }
+              }
+            }
+            if (!sent) {
+              const shot = `/tmp/gemini_not_sent_${Date.now()}.png`;
+              await geminiPage.screenshot({ path: shot }).catch(() => {});
+              throw new Error('Gemini: prompt was never submitted (Send stayed disabled)');
             }
 
-            if (await sendBtn.isVisible().catch(() => false)) {
-              await sendBtn.click({ force: true }).catch(() => {});
-              console.log('    🖱️  Clicked Send button');
-            } else {
-              await geminiPage.keyboard.press('Enter');
-              console.log('    ⌨️  Submitted via Enter key');
-            }
-
-            const deadline = Date.now() + 90000;
+            const deadline = Date.now() + 180000;
             const completeRe = opts.completeWhen || null;
-            const softDeadline = Date.now() + 75000;
+            const softDeadline = Date.now() + 150000;
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -2747,7 +2781,7 @@ jobs:
               const debugShot = `/tmp/gemini_timeout_${Date.now()}.png`;
               await geminiPage.screenshot({ path: debugShot, fullPage: false }).catch(() => {});
               console.warn(`    📸 Timeout screenshot saved: ${debugShot}`);
-              throw new Error('Gemini web timeout: no response within 90s');
+              throw new Error('Gemini web timeout: no response within 180s');
             }
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
@@ -3051,7 +3085,15 @@ jobs:
               let tmpImagePath = null;
               try {
                 tmpImagePath = await imageToTempFile(record, key, kind);
-                let metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                let metadata = null;
+                for (let t = 1; t <= 3 && !metadata; t++) {
+                  try { metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind); }
+                  catch (e) {
+                    console.warn(`  ⚠️ [${db.name}] [${key}] Gemini attempt ${t}/3 failed: ${e.message}`);
+                    if (t === 3) throw e;
+                    await sleep(5000);
+                  }
+                }
                 let check = zedgeEnforce(metadata, 'image');
                 if (check.issues.length) {
                   console.warn(`  🚫 [${db.name}] [${key}] Zedge policy: ${check.issues.join('; ')} — regenerating metadata once`);
