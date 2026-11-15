@@ -2634,20 +2634,23 @@ jobs:
           async function callGeminiWeb(promptText, geminiPage, opts = {}) {
             console.log(`    🌐 Sending prompt (${promptText.length} chars)...`);
 
-            const inputSel = 'div.ql-editor[contenteditable="true"]';
+            const inputSel = 'div.ql-editor[contenteditable="true"], rich-textarea [contenteditable="true"]';
             await geminiPage.waitForSelector(inputSel, { timeout: 15000 });
-            // Dismiss any overlay blocking the input before clicking
             try { await geminiPage.keyboard.press('Escape'); await sleep(300); } catch (_) {}
-            // Use { force: true } to click through any invisible overlay layer
-            await geminiPage.click(inputSel, { force: true });
+
+            const editor = geminiPage.locator(inputSel).first();
+            await editor.click({ force: true });
+            await sleep(200);
             await geminiPage.keyboard.press('Control+a');
             await geminiPage.keyboard.press('Delete');
             await sleep(200);
 
             const getResponseCount = () => geminiPage.evaluate(() => {
               const selectors = [
+                'model-response',
                 'div[id^="model-response-message-content"]',
                 'div[id^="response-message-content"]',
+                '.model-response-text',
                 '.response-content-container',
                 'message-content',
                 'div.message-content'
@@ -2661,70 +2664,91 @@ jobs:
 
             const initialCount = await getResponseCount();
 
-            await geminiPage.keyboard.insertText(promptText);
-            await sleep(800);
-            await geminiPage.keyboard.press('Enter');
-            console.log(`    ⌨️  Submitted via Enter key`);
-            await sleep(800);
+            // Type/insert prompt into editor reliably
+            await editor.fill(promptText).catch(async () => {
+              await geminiPage.keyboard.insertText(promptText);
+            });
+            await sleep(1000);
 
-            // Click Send button directly if Enter did not submit
+            // Wait up to 10s for Send button to become enabled (image upload might still be processing)
             const sendBtn = geminiPage.locator(
               'button[aria-label="Send message"], button[aria-label*="Send"], button.send-button'
             ).first();
+
+            for (let w = 0; w < 20; w++) {
+              const vis = await sendBtn.isVisible().catch(() => false);
+              const dis = await sendBtn.getAttribute('aria-disabled').catch(() => 'true');
+              const nativeDis = await sendBtn.isDisabled().catch(() => true);
+              if (vis && dis !== 'true' && !nativeDis) break;
+              await sleep(500);
+            }
+
             if (await sendBtn.isVisible().catch(() => false)) {
-              const isDisabled = await sendBtn.getAttribute('aria-disabled');
-              if (isDisabled !== 'true') {
-                await sendBtn.click({ force: true }).catch(() => {});
-                console.log('    🖱️  Clicked Send button');
-              }
+              await sendBtn.click({ force: true }).catch(() => {});
+              console.log('    🖱️  Clicked Send button');
+            } else {
+              await geminiPage.keyboard.press('Enter');
+              console.log('    ⌨️  Submitted via Enter key');
             }
 
             const deadline = Date.now() + 90000;
-            // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
-            // (opts.completeWhen). Before, a 3 s pause while Gemini was still streaming was mistaken for a
-            // finished answer -> half a template got parsed -> the audio prompt silently fell back to
-            // "electronic synth pulse" while title/tags described another sound (ringtone != metadata).
             const completeRe = opts.completeWhen || null;
-            const softDeadline = Date.now() + 75000;   // after this a stable partial reply is accepted (the parser validates it)
+            const softDeadline = Date.now() + 75000;
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
 
             while (Date.now() < deadline) {
               await sleep(1500);
-              const currentCount = await getResponseCount();
-              if (currentCount <= initialCount) continue;
 
-              const latestText = await geminiPage.evaluate(() => {
+              const latestText = await geminiPage.evaluate((initCnt) => {
                 const selectors = [
+                  'model-response',
                   'div[id^="model-response-message-content"]',
                   'div[id^="response-message-content"]',
-                  '.response-content p',
+                  '.model-response-text',
+                  '.markdown',
                   'message-content',
                   'div.message-content'
                 ];
                 const allMatching = [];
+                const seen = new Set();
                 for (const sel of selectors) {
-                  document.querySelectorAll(sel).forEach(el => allMatching.push(el));
+                  document.querySelectorAll(sel).forEach(el => {
+                    if (!seen.has(el)) {
+                      seen.add(el);
+                      allMatching.push(el);
+                    }
+                  });
                 }
                 if (allMatching.length === 0) return '';
                 allMatching.sort((a, b) => (a.compareDocumentPosition(b) & 4) ? -1 : 1);
                 const lastEl = allMatching[allMatching.length - 1];
-                return lastEl ? (lastEl.innerText || lastEl.textContent || '').trim() : '';
-              }).catch(() => '');
+                const txt = lastEl ? (lastEl.innerText || lastEl.textContent || '').trim() : '';
+                return txt;
+              }, initialCount).catch(() => '');
 
-              if (!latestText) continue;
+              // Ignore if the captured text is just our own prompt echoed back or empty
+              if (!latestText || latestText.includes('You are an expert image curator')) continue;
 
               if (latestText === lastSeen) {
                 stableCount++;
-                if (stableCount >= 2 && (!completeRe || completeRe.test(latestText) || Date.now() > softDeadline)) { responseText = latestText; break; }
+                if (stableCount >= 2 && (!completeRe || completeRe.test(latestText) || Date.now() > softDeadline)) {
+                  responseText = latestText;
+                  break;
+                }
               } else {
                 lastSeen = latestText;
                 stableCount = 0;
               }
             }
 
-            if (!responseText) throw new Error('Gemini web timeout: no response within 90s');
+            if (!responseText) {
+              const debugShot = `/tmp/gemini_timeout_${Date.now()}.png`;
+              await geminiPage.screenshot({ path: debugShot, fullPage: false }).catch(() => {});
+              console.warn(`    📸 Timeout screenshot saved: ${debugShot}`);
+              throw new Error('Gemini web timeout: no response within 90s');
+            }
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
           }
