@@ -2914,7 +2914,7 @@ jobs:
           }
 
           // ─── GENERATE METADATA FOR ONE IMAGE VIA GEMINI ───────────────────────────
-          async function generateImageMetadata(imagePath, key, geminiPage, kind) {
+          async function generateImageMetadata(imagePath, key, geminiPage, kind, compact = false) {
             console.log(`  🤖 Generating metadata for image [${key}]...`);
 
             // Open a fresh Gemini chat for each image
@@ -2978,7 +2978,16 @@ jobs:
               `[DESCRIPTION]...[/DESCRIPTION]\n` +
               `[POLICY]OK or FLAG: reason[/POLICY]`;
 
-            const responseText = await callGeminiWeb(METADATA_PROMPT, geminiPage, { completeWhen: /\[\s*\/\s*POLICY\s*\]/i });
+            // v9: short prompt used on retries - the long policy-heavy prompt may be what Gemini's filter rejects
+            const COMPACT_PROMPT =
+              `Look at the attached image and reply ONLY in this exact format:\n` +
+              `[TITLE]original title, max 25 characters[/TITLE]\n` +
+              `[KEYWORDS]10 descriptive single-word keywords, comma-separated[/KEYWORDS]\n` +
+              `[CATEGORY]one of: ${validCategories}[/CATEGORY]\n` +
+              `[DESCRIPTION]max 5 words[/DESCRIPTION]\n` +
+              `[POLICY]OK, or FLAG: reason if it shows a copyrighted character, brand/logo, real person, or adult content[/POLICY]`;
+            if (compact) console.log(`  ✂️  Using COMPACT prompt (${COMPACT_PROMPT.length} chars instead of ${METADATA_PROMPT.length})`);
+            const responseText = await callGeminiWeb(compact ? COMPACT_PROMPT : METADATA_PROMPT, geminiPage, { completeWhen: /\[\s*\/\s*POLICY\s*\]/i });
 
             // Parse response tags
             const getTagValue = (text, tag) => {
@@ -3107,6 +3116,16 @@ jobs:
             process.exit(1);
           }
 
+          // ─── v9 PROBE: can this session send ANY message? (separates session/IP problems from prompt problems) ───
+          try {
+            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(3000);
+            const probeReply = await callGeminiWeb('Reply with the single word OK', geminiPage);
+            console.log(`🧪 PROBE text-only message: WORKS (reply: "${probeReply.slice(0, 40).replace(/\s+/g, ' ')}") -> session/IP are fine, the problem is the image or prompt`);
+          } catch (pe) {
+            console.error(`🧪 PROBE text-only message: FAILED (${pe.message.slice(0, 120)}) -> Gemini rejects EVERY message from this session/runner IP. Re-export GEMINI_SESSION or run from a different network; prompt/image changes cannot fix this.`);
+          }
+
           // ─── PROCESS EACH DB TARGET ───────────────────────────────────────────────
           let totalSuccess = 0;
           let totalHeld = 0;
@@ -3155,7 +3174,7 @@ jobs:
                       }
                     } catch (e2) { console.warn(`  ⚠️ downscale failed: ${String(e2.message).split('\n')[0]}`); }
                   }
-                  try { metadata = await generateImageMetadata(useImg, key, geminiPage, kind); }
+                  try { metadata = await generateImageMetadata(useImg, key, geminiPage, kind, t >= 2); }
                   catch (e) {
                     console.warn(`  ⚠️ [${db.name}] [${key}] Gemini attempt ${t}/3 failed: ${e.message}`);
                     if (t === 3) throw e;
